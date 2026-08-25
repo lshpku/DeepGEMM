@@ -215,6 +215,10 @@ CUTLASS_DEVICE void st_relaxed_sys(const uint64_t* ptr, const uint64_t& value) {
     asm volatile("st.L1::no_allocate.relaxed.sys.global.u64 [%0], %1;" :: "l"(ptr), "l"(value));
 }
 
+CUTLASS_DEVICE void st_rel_sys(const int* ptr, const int& value) {
+    asm volatile("st.release.sys.global.s32 [%0], %1;" :: "l"(ptr), "r"(value));
+}
+
 /// Atomics
 CUTLASS_DEVICE uint32_t atomic_add(const uint32_t* ptr, const uint32_t& value) {
     uint32_t ret;

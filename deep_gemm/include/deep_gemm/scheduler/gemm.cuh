@@ -1,5 +1,6 @@
 #pragma once
 
+#include <deep_gemm/common/chunk_task.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/types.cuh>
 
@@ -61,6 +62,8 @@ struct Scheduler {
     uint32_t next_group_idx, next_shape_k;
     // Only used for `KGroupedContiguousWithPsumLayout`
     uint32_t current_k_start = 0, current_k_end = 0;
+    // Only used for the chunk layout: the block M offset of the current chunk
+    uint32_t chunk_m_block_offset = 0;
 
     // Only used for k-grouped gemm
     CUTLASS_DEVICE void get_next_k_group(uint32_t &group_idx, uint32_t &shape_k) const {
@@ -95,6 +98,17 @@ struct Scheduler {
         } else if constexpr (kGemmType == GemmType::MGroupedContiguous) {
             num_blocks = num_m_blocks * num_n_blocks;
             this->grouped_layout = grouped_layout;
+        } else if constexpr (kGemmType == GemmType::MGroupedChunk) {
+            // NOTES: for this type, `grouped_layout` is the CTA's staged task descriptor
+            //        (see `chunk::stage_task`), not the queue itself
+            const auto task = chunk::load_staged_task(grouped_layout);
+            DG_TRAP_ONLY_DEVICE_ASSERT(task.m_start % BLOCK_M == 0);
+
+            // The expert index selects the weight group, and only the chunk's rows are scheduled
+            current_group_idx = static_cast<uint32_t>(task.expert_idx);
+            chunk_m_block_offset = static_cast<uint32_t>(task.m_start) / BLOCK_M;
+            num_m_blocks = math::ceil_div(static_cast<uint32_t>(task.m_size), BLOCK_M);
+            num_blocks = num_m_blocks * num_n_blocks;
         } else if constexpr (kGemmType == GemmType::MGroupedMasked) {
             this->grouped_layout = grouped_layout;
         } else if constexpr (kGemmType == GemmType::MGroupedContiguousWithPsumLayout) {
@@ -160,7 +174,8 @@ struct Scheduler {
         } else if constexpr (kGemmType == GemmType::MGroupedContiguous) {
             const auto offset = kWithGroupOffset ? cute::max(0, grouped_layout[m_block_idx * BLOCK_M]) : 0;
             return offset * shape_dim + block_idx * block_size;
-        } else if constexpr (kGemmType == GemmType::MGroupedMasked or kGemmType == GemmType::MGroupedContiguousWithPsumLayout) {
+        } else if constexpr (kGemmType == GemmType::MGroupedMasked or kGemmType == GemmType::MGroupedContiguousWithPsumLayout or
+                             kGemmType == GemmType::MGroupedChunk) {
             const auto offset = kWithGroupOffset ? current_group_idx : 0;
             return offset * shape_dim + block_idx * block_size;
         } else if constexpr (is_k_grouped_contiguous(kGemmType)) {
@@ -282,6 +297,11 @@ struct Scheduler {
                                 num_m_blocks % kNumMulticast == 0 or                  // Always aligned on M (constant bypass)
                                 (next_block_idx ^ 1) < num_blocks;                    // Peer CTA in bound
             get_swizzled_block_idx(next_block_idx, m_block_idx, n_block_idx);
+
+            // Shift into the chunk's row range
+            // NOTES: the offset is uniform across the cluster, so multicasting is unaffected
+            if constexpr (kGemmType == GemmType::MGroupedChunk)
+                m_block_idx += chunk_m_block_offset;
         }
         return true;
     }

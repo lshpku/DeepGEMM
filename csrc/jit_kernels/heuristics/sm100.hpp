@@ -31,7 +31,8 @@ struct SM100ArchSpec {
         // Always enable swap A/B (and multicasting if possible) for m-grouped GEMMs
         if (desc.gemm_type == GemmType::MGroupedContiguous or
             desc.gemm_type == GemmType::MGroupedContiguousWithPsumLayout or
-            desc.gemm_type == GemmType::MGroupedMasked) {
+            desc.gemm_type == GemmType::MGroupedMasked or
+            desc.gemm_type == GemmType::MGroupedChunk) {
             const bool swap_ab = true;
             const auto block_n = 128;
             const auto block_m = heuristics_runtime->get_mk_alignment_for_contiguous_layout();

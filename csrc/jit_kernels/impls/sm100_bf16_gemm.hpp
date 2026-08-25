@@ -24,6 +24,9 @@ public:
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_cd;
+
+        // Only used by the chunk layout: which task of the queue this launch claims
+        uint32_t task_idx = 0;
     };
 
     static std::string generate_impl(const Args& args) {
@@ -72,6 +75,7 @@ static void __instantiate_kernel() {{
         // TODO: optimize `args` copy
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.grouped_layout, args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
+            args.task_idx,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_cd));
     }
@@ -196,6 +200,67 @@ static void sm100_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
     };
     const auto code = SM100BF16GemmRuntime::generate(args);
     const auto runtime = compiler->build("sm100_bf16_m_grouped_gemm_contiguous", code);
+    SM100BF16GemmRuntime::launch(runtime, args);
+}
+
+// One launch computes exactly one chunk task, claimed from `task_queue` by `task_idx`
+// NOTES: `A`/`D` use the whole contiguous (128-aligned) unzipped layout, and the task
+//        descriptor tells the kernel which row range and which expert to use
+static void sm100_bf16_chunk_gemm(const torch::Tensor& a,
+                                  const torch::Tensor& b,
+                                  const torch::Tensor& d,
+                                  const torch::Tensor& task_queue,
+                                  const int& task_idx,
+                                  const int& num_groups, const int& m, const int& n, const int& k,
+                                  const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                  const std::string& compiled_dims) {
+    const auto desc = GemmDesc {
+        .gemm_type = GemmType::MGroupedChunk,
+        .kernel_type = KernelType::KernelNoSF,
+        .m = m, .n = n, .k = k, .num_groups = num_groups,
+        .a_dtype = a.scalar_type(), .b_dtype = b.scalar_type(),
+        .cd_dtype = d.scalar_type(),
+        .major_a = major_a, .major_b = major_b,
+        .with_accumulation = false,
+        .num_sms = device_runtime->get_num_sms(),
+        .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims
+    };
+    const auto config = get_best_config<SM100ArchSpec>(desc);
+
+    // The chunk's row offset must be block-M aligned, as the scheduler shifts whole M blocks
+    DG_HOST_ASSERT(heuristics_runtime->get_mk_alignment_for_contiguous_layout() == config.layout.block_m);
+
+    const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
+                                              config.storage_config.load_block_m,
+                                              config.layout.block_k,
+                                              static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), 1,
+                                              config.storage_config.swizzle_a_mode);
+    const auto tensor_map_b = make_tma_b_desc(major_b, b, n, k,
+                                              config.storage_config.load_block_n,
+                                              config.layout.block_k,
+                                              static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), num_groups,
+                                              config.storage_config.swizzle_b_mode);
+    const auto tensor_map_cd = make_tma_cd_desc(d, m, n,
+                                                config.storage_config.store_block_m,
+                                                config.storage_config.store_block_n,
+                                                static_cast<int>(d.stride(-2)), 1,
+                                                config.storage_config.swizzle_cd_mode);
+
+    // Launch
+    const SM100BF16GemmRuntime::Args args = {
+        .gemm_desc = desc,
+        .gemm_config = config,
+        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
+                                  config.pipeline_config.smem_size,
+                                  config.layout.get_cluster_size()),
+        .grouped_layout = task_queue.data_ptr(),
+        .tensor_map_a = tensor_map_a,
+        .tensor_map_b = tensor_map_b,
+        .tensor_map_cd = tensor_map_cd,
+        .task_idx = static_cast<uint32_t>(task_idx)
+    };
+    const auto code = SM100BF16GemmRuntime::generate(args);
+    const auto runtime = compiler->build("sm100_bf16_chunk_gemm", code);
     SM100BF16GemmRuntime::launch(runtime, args);
 }
 

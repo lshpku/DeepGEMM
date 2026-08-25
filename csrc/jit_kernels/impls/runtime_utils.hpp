@@ -48,6 +48,7 @@ static std::string to_string(const GemmType& type) {
         case GemmType::KGroupedContiguous:                  return "GemmType::KGroupedContiguous";
         case GemmType::KGroupedContiguousWithPsumLayout:    return "GemmType::KGroupedContiguousWithPsumLayout";
         case GemmType::Batched:                             return "GemmType::Batched";
+        case GemmType::MGroupedChunk:                       return "GemmType::MGroupedChunk";
     }
     DG_HOST_UNREACHABLE("Unknown GEMM type");
 }

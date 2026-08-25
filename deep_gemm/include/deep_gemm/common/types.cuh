@@ -25,12 +25,18 @@ enum class GemmType {
     Batched                             = 4,
     MGroupedContiguousWithPsumLayout    = 5,
     KGroupedContiguousWithPsumLayout    = 6,
+    MGroupedChunk                       = 7,
 };
+
+// Number of `int32` fields per chunk task: `[expert_idx, m_start, m_size, ready]`
+constexpr uint32_t kNumChunkTaskFields = 4;
 
 constexpr CUTLASS_HOST_DEVICE bool is_m_grouped_contiguous(const GemmType& gemm_type) {
     switch (gemm_type) {
         case GemmType::MGroupedContiguous:                  return true;
         case GemmType::MGroupedContiguousWithPsumLayout:    return true;
+        // NOTES: the chunk layout is the contiguous layout, only restricted to one chunk of one expert
+        case GemmType::MGroupedChunk:                       return true;
         default: return false;
     }
 }
