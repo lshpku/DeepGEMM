@@ -26,6 +26,10 @@ print("deep_gemm:", deep_gemm.__path__)
 E = 16
 H = 4096
 I = 2048
+EP = 16
+SEQLEN = 16384
+TOPK = 8
+
 CHUNK = 4096
 NUM_SMS = 96
 ALIGNMENT = 128
@@ -41,8 +45,6 @@ def parse_args():
                         help="delay between two arrivals, for the `cpu` and `gpu` modes")
     parser.add_argument("--check-signal", action="store_true",
                         help="verify `token_done` after every chunk, which forces a sync per chunk")
-    parser.add_argument("--num-tokens", type=int, default=16384)
-    parser.add_argument("--topk", type=int, default=8)
     return parser.parse_args()
 
 
@@ -53,29 +55,59 @@ def calc_diff(x, y):
     return (1 - sim).item()
 
 
-def make_routed_layout(num_tokens, topk, seed=0):
-    """Build the unzipped layout of a real routing, i.e. what dispatch + unzip produce.
+def make_routed_layout():
+    """
+    模拟在一个 EP 组内, 每个 rank 有 E 个专家的情况下, rank 0 收到的 dispatch+unzip 后的 token.
 
     Every unduplicated token appears once under each of its top-k experts, and each
     expert's region is padded to `ALIGNMENT` rows as the GEMM requires.
     """
-    rng = np.random.default_rng(seed)
-    route = np.argsort(rng.random((num_tokens, E)), axis=1)[:, :topk]
+    # 模拟全局 token 打分
+    scores = paddle.randn([EP * SEQLEN, EP * E])
+    scores += paddle.randn([EP * E]) * 0.1  # add some system bias to experts
+    _, topk_indices = scores.topk(TOPK)
+    topk_indices = topk_indices.cast("int32").sort()
 
-    expert_tokens = [np.sort(np.where((route == e).any(axis=1))[0]) for e in range(E)]
-    counts = [len(tokens) for tokens in expert_tokens]
-    aligned = [(c + ALIGNMENT - 1) // ALIGNMENT * ALIGNMENT for c in counts]
-    m_start = np.cumsum([0] + aligned[:-1]).tolist()
+    # 只保留命中 rank0 的 token
+    topk_hit = topk_indices < E
+    token_hit = topk_hit.any(axis=1).nonzero().squeeze(1)
 
-    # `-1` marks the padded rows, which no chunk ever covers
-    row_to_token = np.full(sum(aligned), -1, dtype=np.int32)
-    m_indices = np.zeros(sum(aligned), dtype=np.int32)
-    for expert_idx in range(E):
-        start, count = m_start[expert_idx], counts[expert_idx]
-        row_to_token[start: start + count] = expert_tokens[expert_idx]
-        m_indices[start: start + aligned[expert_idx]] = expert_idx
+    topk_indices[~topk_hit] = -1
+    topk_indices = topk_indices.gather(token_hit, axis=0)
 
-    return counts, m_start, row_to_token, m_indices
+    # Note:
+    # 1) topk_indices[num_recv_tokens, topk] 是通信 kernel 内部维护的一个状态,
+    #    在 dispatch 完成前处于离散、不完整状态, 因此对于计算 kernel 来说不可见;
+    # 2) topk_indices 的顺序与 unzipped_tokens 中的顺序没有必然关系, 虽然实际上
+    #    unzipped_tokens 中的 token 会相对有序, 但通信的不确定性让其顺序无法保证,
+    #    因此下面 row_to_token 测试的也是最极端的随机打乱的情况.
+
+    tokens_per_expert = paddle.sum(
+        paddle.arange(E, dtype="int32")[:, None] == topk_indices.flatten(),
+        axis=1,
+    ).tolist()
+
+    # 构造计算可见的相关 meta
+    m_start, row_to_token, m_indices = [0], [], []
+
+    for expert_idx, n in enumerate(tokens_per_expert):
+        n_aligned = (n + ALIGNMENT - 1) // ALIGNMENT * ALIGNMENT
+        m_start.append(m_start[-1] + n_aligned)
+        m_indices.append(paddle.full([n_aligned], expert_idx, dtype="int32"))
+
+        # 选出属于 expert_idx 的 token 并打乱顺序
+        token_idxs = (topk_indices == expert_idx).any(axis=1).nonzero().squeeze(1)
+        assert len(token_idxs) == n
+        perm = paddle.randperm(token_idxs.shape[0])
+        row_to_token.append(token_idxs.astype("int32")[perm])
+        if n % ALIGNMENT > 0:
+            row_to_token.append(paddle.full([ALIGNMENT - n % ALIGNMENT], -1, dtype="int32"))
+
+    m_start = m_start[:-1]
+    row_to_token = paddle.concat(row_to_token)
+    m_indices = paddle.concat(m_indices)
+
+    return tokens_per_expert, topk_indices, m_start, row_to_token, m_indices
 
 
 def make_task_queue(counts, m_start, ready, seed=0):
@@ -123,18 +155,39 @@ def split_gate_up(o1):
     return o1[:, :I], o1[:, I:]
 
 
-def reference(x, w_gateup, w_down, probs, m_indices, correctness=True):
+def reference(x, w_gateup, w_down, probs, m_indices, perf=None):
+    if perf is not None:
+        # 模拟调用 zip/unzip, 实际结果无用
+        topk_indices, tokens_per_expert = perf
+        _, rowmap, unzipped_probs, _ = paddle.nn.functional.moe_permute(
+            x[:len(topk_indices)],
+            None,  # scale
+            topk_indices,
+            paddle.empty(topk_indices.shape, dtype="float32"),  # topk_probs
+            padding_alignment=ALIGNMENT,
+            num_experts=E,
+            tokens_per_expert=tokens_per_expert,
+        )
+        paddle.nn.functional.moe_unpermute(
+            x,
+            rowmap,
+            topk_indices,
+            unzipped_probs,
+            total_zipped_tokens=len(topk_indices),
+            num_experts=E,
+        )
+
     o1 = paddle.empty([x.shape[0], 2 * I], dtype="bfloat16")
     deep_gemm.m_grouped_bf16_gemm_nn_contiguous(x, w_gateup, o1, m_indices)
 
-    if correctness:
-        gate, up = split_gate_up(o1)
-        gate, up = gate.float(), up.float()
-        o2 = (F.silu(gate) * up * probs.unsqueeze(-1)).astype("bfloat16")
-    else:
+    if perf is not None:
         # 仅模拟 swiglu 融合算子的访存带宽，用于测试性能
         gate, up = o1[:x.shape[0] // 2], o1[x.shape[0] // 2:]
         o2 = (gate + up).reshape([x.shape[0], I])
+    else:
+        gate, up = split_gate_up(o1)
+        gate, up = gate.float(), up.float()
+        o2 = (F.silu(gate) * up * probs.unsqueeze(-1)).astype("bfloat16")
 
     o3 = paddle.empty([x.shape[0], H], dtype="bfloat16")
     deep_gemm.m_grouped_bf16_gemm_nn_contiguous(o2, w_down, o3, m_indices)
@@ -169,19 +222,19 @@ def main():
         "--check-signal syncs per chunk, which defeats the point of an async arrival"
     )
 
-    counts, m_start, row_to_token_np, m_indices_np = make_routed_layout(args.num_tokens, args.topk)
-    m_total = len(row_to_token_np)
+    tokens_per_expert, topk_indices, m_start, row_to_token, m_indices = make_routed_layout()
+    num_recv_tokens = len(topk_indices)
+    m_total = len(row_to_token)
     print("arrival:", args.arrival, "| interval:", args.interval_ms,
           "ms | check_signal:", args.check_signal)
-    print("tokens_per_expert:", counts)
-    print("num_unzipped_tokens:", m_total, "num_tokens:", args.num_tokens, "topk:", args.topk)
+    print("num_recv_tokens:", num_recv_tokens)
+    print("tokens_per_expert:", tokens_per_expert)
+    print("num_unzipped_tokens:", m_total, "seq_len:", SEQLEN, "topk:", TOPK)
 
     x = paddle.randn([m_total, H], "bfloat16")
     w_gateup = paddle.randn([E, H, 2 * I], "bfloat16") * 0.02
     w_down = paddle.randn([E, I, H], "bfloat16") * 0.02
     probs = paddle.rand([m_total], "float32")
-    row_to_token = paddle.to_tensor(row_to_token_np)
-    m_indices = paddle.to_tensor(m_indices_np)
 
     if FUSE_SWIGLU:
         w_gateup = interleave_gateup(w_gateup)
@@ -195,19 +248,24 @@ def main():
                 paddle.full([m_total, 2 * I], float("nan"), "bfloat16"),
                 paddle.full([m_total, I], float("nan"), "bfloat16"),
                 paddle.full([m_total, H], float("nan"), "bfloat16"),
-                row_to_token, paddle.zeros([args.num_tokens], "int32"))
+                row_to_token, paddle.zeros([num_recv_tokens], "int32"))
 
     ################################# BASELINE #################################
-    ready_queue = make_task_queue(counts, m_start, ready=1)
+    ready_queue = make_task_queue(tokens_per_expert, m_start, ready=1)
     num_tasks = ready_queue.shape[0]
     print("num_tasks:", num_tasks)
     buffers = make_buffers()
+    tasks = ready_queue.tolist()
+
+    # warmup
+    compute_chunk(0, buffers, ready_queue)
+    reference(x, w_gateup, w_down, probs, m_indices, perf=(topk_indices, tokens_per_expert))
+    reference_gateup_chunk(buffers, tasks)
+    paddle.base.core.nvprof_start()
 
     # 直接预填充所有 ready=1，测试无等待情况下的性能
-    for i in range(4):
-        if i == 1:
-            paddle.base.core.nvprof_start()
-        paddle.base.core.nvprof_nvtx_push("ready")
+    for i in range(3):
+        paddle.base.core.nvprof_nvtx_push("chunk_all_ready")
         for task_idx in range(num_tasks):
             compute_chunk(task_idx, buffers, ready_queue)
         paddle.base.core.nvprof_nvtx_pop()
@@ -215,13 +273,13 @@ def main():
     # 测试 baseline group_gemm 的性能
     for i in range(3):
         paddle.base.core.nvprof_nvtx_push("baseline_group_gemm")
-        reference(x, w_gateup, w_down, probs, m_indices, correctness=False)
+        reference(x, w_gateup, w_down, probs, m_indices,
+                  perf=(topk_indices, tokens_per_expert))
         paddle.base.core.nvprof_nvtx_pop()
 
-    # 测试分别调用 baseline gemm 的性能
-    tasks = ready_queue.tolist()
+    # 测试分别调用 baseline gateup 的性能
     for i in range(3):
-        paddle.base.core.nvprof_nvtx_push("baseline_gemm")
+        paddle.base.core.nvprof_nvtx_push("baseline_gateup_chunk")
         reference_gateup_chunk(buffers, tasks)
         paddle.base.core.nvprof_nvtx_pop()
 
@@ -229,12 +287,12 @@ def main():
     # The queue under test, plus the CPU-side view of it for the `cpu` mode
     interval_s = args.interval_ms / 1e3
     task_queue = (ready_queue if args.arrival == "ready"
-                  else make_task_queue(counts, m_start, ready=0))
+                  else make_task_queue(tokens_per_expert, m_start, ready=0))
     queue_rows = task_queue.tolist()
 
     buffers = make_buffers()
     o1, o2, o3, token_done = buffers[4], buffers[5], buffers[6], buffers[8]
-    expected = np.zeros([args.num_tokens], dtype=np.int32)
+    expected = np.zeros([num_recv_tokens], dtype=np.int32)
 
     # 模拟独立的通信流和计算流，与默认流分开，否则后面写 task_queue 会死锁
     comm_stream, compute_stream = paddle.cuda.Stream(), paddle.cuda.Stream()
@@ -255,7 +313,7 @@ def main():
                 # Verify the counters grow exactly as the chunks complete
                 paddle.device.synchronize()
                 _, chunk_start, chunk_size, _ = queue_rows[task_idx]
-                expected[row_to_token_np[chunk_start: chunk_start + chunk_size]] += 1
+                expected[row_to_token[chunk_start : chunk_start + chunk_size]] += 1
                 got = token_done.numpy()
                 assert np.array_equal(got, expected), (
                     f"token_done mismatch after task {task_idx}: {np.flatnonzero(got != expected)[:8]}"
@@ -282,17 +340,17 @@ def main():
     ################################# VALIDATE #################################
     # Only the real rows are compared: the padded rows are computed by the reference but
     # zeroed (o2) or left as the down GEMM's garbage (o3) by the chunk path
-    real_rows = paddle.to_tensor(np.flatnonzero(row_to_token_np >= 0).astype(np.int32))
+    valid_rows = row_to_token.nonzero()
     for name, out, ref, tol in (("o1", o1, o1_ref, 0.0), ("o2", o2, o2_ref, 1e-6), ("o3", o3, o3_ref, 1e-6)):
-        diff = calc_diff(out.index_select(real_rows), ref.index_select(real_rows))
+        diff = calc_diff(out.index_select(valid_rows), ref.index_select(valid_rows))
         print(f"{name}: diff={diff:.3e}")
         assert diff <= tol, f"{name} mismatch: {diff}"
 
     # Every token must have been counted by exactly its own number of experts
     final = token_done.numpy()
     print("token_done: min:", final.min(), "max:", final.max(),
-          "| padded rows:", int((row_to_token_np < 0).sum()), "(never signalled)")
-    assert np.array_equal(final, np.full([args.num_tokens], args.topk, dtype=np.int32))
+          "| padded rows:", int((row_to_token < 0).sum()), "(never signalled)")
+    assert np.array_equal(final, paddle.sum(topk_indices >= 0, axis=1).numpy())
 
     print("PASSED")
 
