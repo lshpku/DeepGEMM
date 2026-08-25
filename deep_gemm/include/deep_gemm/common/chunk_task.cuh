@@ -22,14 +22,20 @@ struct ChunkTask {
 // Wait until the chunk has arrived, to be called by one thread per CTA
 // NOTES: the flag is loaded with system scope, so both a device-memory queue (the real
 //        dispatch) and a mapped host memory queue (single-card simulation) work
-CUTLASS_DEVICE void wait_task_ready(const int* task_queue, const uint32_t& task_idx) {
+// NOTES: the timeout must not trap (nor assert, which also calls `printf`) inside this
+//        divergent region as it will harm performance. Let the caller trap instead
+CUTLASS_DEVICE bool wait_task_ready(const int* task_queue, const uint32_t& task_idx) {
     const auto* ready = task_queue + task_idx * kNumChunkTaskFields + 3;
     const auto start_clock = clock64();
+    bool timed_out = false;
     while (ptx::ld_acq_sys(ready) == 0) {
         __nanosleep(kPollIntervalNs);
-        DG_DEVICE_ASSERT(static_cast<uint64_t>(clock64() - start_clock) < kReadyTimeoutCycles and
-                         "Timeout on waiting for the chunk to arrive");
+        if (static_cast<uint64_t>(clock64() - start_clock) >= kReadyTimeoutCycles) {
+            timed_out = true;
+            break;
+        }
     }
+    return timed_out;
 }
 
 // Read the task descriptor from the queue, to be called by one thread per CTA

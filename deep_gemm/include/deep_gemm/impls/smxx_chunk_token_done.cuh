@@ -17,12 +17,14 @@ smxx_chunk_token_done_impl(const int* task_queue, uint32_t task_idx,
     cudaGridDependencySynchronize();
 
     // Claim the task, in the same way as the compute kernels
-    __shared__ int smem_task[3];
+    __shared__ int smem_task[4];
     if (threadIdx.x == 0) {
-        chunk::wait_task_ready(task_queue, task_idx);
+        const auto timed_out = chunk::wait_task_ready(task_queue, task_idx);
         chunk::stage_task(smem_task, chunk::read_task(task_queue, task_idx));
+        smem_task[3] = timed_out ? 1 : 0;
     }
     __syncthreads();
+    DG_TRAP_ONLY_DEVICE_ASSERT(smem_task[3] == 0);
     const auto task = chunk::load_staged_task(smem_task);
     const auto m_start = static_cast<uint32_t>(task.m_start);
     const auto m_size = static_cast<uint32_t>(task.m_size);

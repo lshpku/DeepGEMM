@@ -181,10 +181,13 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     auto smem_task = reinterpret_cast<int*>(smem_buffer);
     if constexpr (kGemmType == GemmType::MGroupedChunk) {
         if (threadIdx.x == 0) {
-            chunk::wait_task_ready(grouped_layout, task_idx);
+            const auto timed_out = chunk::wait_task_ready(grouped_layout, task_idx);
             chunk::stage_task(smem_task, chunk::read_task(grouped_layout, task_idx));
+            smem_task[3] = timed_out ? 1 : 0;
         }
         __syncthreads();
+
+        DG_TRAP_ONLY_DEVICE_ASSERT(smem_task[3] == 0);
     }
 
     // Block scheduler

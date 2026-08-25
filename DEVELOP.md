@@ -28,12 +28,7 @@ python tests_overlap/test_chunk.py --check-signal
 
 `test_gemm_baseline.py`：对比group_gemm和chunk的性能测试，一个是调用单次group_gemm，一个是分chunk调用，实测性能差距很小，chunk方案仅慢2%，说明分chunk几乎不影响性能
 
-`test_chunk.py`：chunk 流式全链路（gateup, swiglu, down, signal）的正确性测试。按真实路由构造布局（默认 16384 个不重复 token，topk=8，每专家区域向 128 对齐，所以有真的 padding 行），先在异步流上把全部 kernel 发出去让它们卡在 spin-wait 上，最后与 group_gemm 逐位比对 o1/o2/o3（只比真实行）并检查 `token_done` 每个 token 恰好被记 topk 次。参数：
-* `--arrival ready`：任务队列放显存且开始时全部 `ready`，测纯计算/纯 spin 开销（launch 1.9ms，compute 18.4ms，total 20.0ms）
-* `--arrival cpu`：任务队列放 pinned host memory（`CUDAPinnedPlace`），由 CPU 用 ctypes 直接写 `ready`，间隔 `--interval-ms`（默认 2ms）；GPU 确实按 CPU 的节奏推进
-* `--arrival gpu`：任务队列放显存，由一个单 SM 的 producer kernel（`deep_gemm.simulate_chunk_arrival`，站位真实通信 kernel）在另一条流上写 `ready`；这条路径才是最终形态，spin 开销落在噪声里（total 98.7ms ≈ arrival 82ms + 计算尾巴），比 pinned 版本快约 10 倍
-* `--check-signal`：每个 chunk 后同步一次，逐个 chunk 比对 `token_done` 与 CPU 算的期望值（41 个 chunk 全部吻合，padding 行 1152 行从不被 signal）；因为要逐 chunk 同步，只能配合 `--arrival ready`
-* 另有 `--interval-ms` / `--num-tokens` / `--topk` 可调，`--interval-ms 0` 即测纯 spin 开销
+`test_chunk.py`：chunk 流式全链路（gateup, swiglu, down, signal）的正确性测试。按真实路由构造布局（默认 16384 个不重复 token，topk=8，每专家区域向 128 对齐，所以有真的 padding 行），先在异步流上把全部 kernel 发出去让它们卡在 spin-wait 上，最后与 group_gemm 逐位比对 o1/o2/o3（只比真实行）并检查 `token_done` 每个 token 恰好被记 topk 次。
 
 
 ## 开发进展
@@ -64,5 +59,12 @@ python tests_overlap/test_chunk.py --check-signal
 8.25: 把四个 chunk 测试合并成 `test_chunk.py`，用 `--arrival {ready,cpu,gpu}` 选到达方式，down signal 默认都发、`--check-signal` 控制是否逐 chunk 校验
 * 顺手修了个坑：producer kernel 原来用连续多次 `__nanosleep` 来等间隔，实测严重超时（请求 82ms 的到达延迟，total 跑到 146ms）；改成用 `clock64()` 计圈（`wait_cycles`），host 侧用 `cudaDeviceGetAttribute(cudaDevAttrClockRate)` 把 ns 换成 cycle，现在 total 98.7ms ≈ 82ms + 计算尾巴
 * CUDA 13 删了 `cudaDeviceProp::clockRate`，只能走 `cudaDeviceGetAttribute`
+
+8.25: 修掉 chunk gemm 比原版慢 45% 的问题：领任务的超时保护里那句 `trap` 拖垮了整个 kernel
+* 现象：同样 41 个 chunk 的 gateup，`bf16_gemm_nn` 分块调用 3.6ms、`m_grouped` 分块调用 3.8ms，而 `bf16_chunk_gemm_nn` 要 8.4ms；单 kernel 隔离测量 167us vs 114us
+* 排查过程：先确认不是 layout 配置（chunk 走的是 m-grouped 那套强制 layout，模板参数和 `m_grouped` 的 cubin 完全一致，只有 GemmType 不同），也不是大 M 的 tensor map 或 `m_start` 偏移（把 chunk kernel 作用在 4096 行的切片上、offset 换成 0，都一样慢）；`cuobjdump -res-usage` 显示 chunk 版多了 `STACK:24`
+* 根因：`wait_task_ready` 的超时保护写在 `if (threadIdx.x == 0)` 这个 divergent 区里，只要里面有可达的 `trap`（`DG_DEVICE_ASSERT` 更糟，它还调 `printf`，会给整个 kernel 一个 local memory frame），ptxas 就会对整个 GEMM 降级，稳定损失约 45%
+* 改法：`wait_task_ready` 只返回是否超时，把 `timed_out` 连同任务描述符一起 stage 到 shared memory，`__syncthreads()` 之后全 CTA 统一 `DG_TRAP_ONLY_DEVICE_ASSERT`；这样超时保护还在，但 trap 在 uniform 区里，代价为零
+* 结果：单 kernel 回到 114us（和 `m_grouped` 持平），41 chunk 总时间 4.0ms vs `m_grouped` 3.8ms；o1/o2/o3 和 `token_done` 仍然全部逐位一致
 
 
