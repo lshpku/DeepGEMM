@@ -24,11 +24,14 @@ python tests_overlap/test_chunk.py --arrival ready
 python tests_overlap/test_chunk.py --arrival cpu
 python tests_overlap/test_chunk.py --arrival gpu
 python tests_overlap/test_chunk.py --check-signal
+python tests_overlap/test_fused_swiglu.py
 ```
 
 `test_gemm_baseline.py`：对比group_gemm和chunk的性能测试，一个是调用单次group_gemm，一个是分chunk调用，实测性能差距很小，chunk方案仅慢2%，说明分chunk几乎不影响性能
 
 `test_chunk.py`：chunk 流式全链路（gateup, swiglu, down, signal）的正确性测试。按真实路由构造布局（默认 16384 个不重复 token，topk=8，每专家区域向 128 对齐，所以有真的 padding 行），先在异步流上把全部 kernel 发出去让它们卡在 spin-wait 上，最后与 group_gemm 逐位比对 o1/o2/o3（只比真实行）并检查 `token_done` 每个 token 恰好被记 topk 次。
+
+`test_fused_swiglu.py`：单算子测试，验证把 weighted SwiGLU 融进 gateup epilogue 的正确性（o1/o2 都与两 kernel 路径逐位一致）和代价（融合只多 2us，独立 swiglu kernel 要 26us）
 
 
 ## 开发进展
@@ -66,5 +69,15 @@ python tests_overlap/test_chunk.py --check-signal
 * 根因：`wait_task_ready` 的超时保护写在 `if (threadIdx.x == 0)` 这个 divergent 区里，只要里面有可达的 `trap`（`DG_DEVICE_ASSERT` 更糟，它还调 `printf`，会给整个 kernel 一个 local memory frame），ptxas 就会对整个 GEMM 降级，稳定损失约 45%
 * 改法：`wait_task_ready` 只返回是否超时，把 `timed_out` 连同任务描述符一起 stage 到 shared memory，`__syncthreads()` 之后全 CTA 统一 `DG_TRAP_ONLY_DEVICE_ASSERT`；这样超时保护还在，但 trap 在 uniform 区里，代价为零
 * 结果：单 kernel 回到 114us（和 `m_grouped` 持平），41 chunk 总时间 4.0ms vs `m_grouped` 3.8ms；o1/o2/o3 和 `token_done` 仍然全部逐位一致
+
+8.25: 把 weighted SwiGLU 融进 gateup 的 epilogue，chunk=4096 时 swiglu 从 26us 降到 2us
+* DeepGEMM 原生只有 `epilogue_type_t::apply_index_n` 这一个 hook（`EpilogueHeadSplits` 在用），只能改 TMA store 的 N 下标，不能改数值，所以融合得自己加一段
+* 关键观察：swap-AB 的 epilogue 每个 store stage 会把 `[16, BLOCK_N=128]` 的结果按 128B swizzle 落到 shared memory，而这块 smem 正好是两个 `[16, 64]` 的 atom；只要权重列按 64 一组交错成 `[gate0:64, up0:64, gate64:128, ...]`（运行时零成本），gate 和 up 就落在同一个 stage 的两个 atom 里，直接在 epilogue 里读回来算完就行
+* 实现：`sm100_store_cd_swap_ab` 加 `kWithFusedSwiGLU` 模板参数，128 个 epilogue 线程每人从 smem 取一对 16B（gate/up 各 8 个 bf16），fp32 算完直接 16B 写 o2；o1 的 TMA store 完全不变（反向要用），o2 因此不再需要整块常驻显存，只要一个 chunk 大小的 buffer
+* API 就挂在 `bf16_chunk_gemm_nn` 上：多给 `o2`/`probs` 两个可选参数就启用融合，不另开接口，也不做非 task queue 的版本（baseline 用旧的 `bf16_gemm_nn` 就够）
+* 精度：读的是已经 cast 成 bf16 的 o1，和两 kernel 路径完全一样，实测 o1/o2 都与 paddle 参考逐位一致
+* 大坑：一开始用 `g / (1.0f + __expf(-g))`，融合开销 26us；换成 `__fdividef` 后只剩 2.1us。IEEE 除法在 epilogue 这种和 MMA 抢线程的地方极贵，独立 swiglu kernel 同样吃这个亏（38us → 26us）
+* 现状（m=4096, H=4096, I=2048, 96 SM）：纯 gateup 111us，融合版 113.6us，独立 swiglu 还要 26us；独立 kernel 只跑到 1.96 TB/s，仍然是延迟受限（每线程 in-flight 太少），但既然融合几乎免费就不再优化它
+* 下一步：把融合接到 chunk 版 GEMM（`MGroupedChunk`）上，o2 换成 chunk 大小的复用 buffer，并把交错权重的准备放到上层
 
 

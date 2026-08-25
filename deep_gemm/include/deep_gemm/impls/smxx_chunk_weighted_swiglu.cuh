@@ -65,6 +65,7 @@ smxx_chunk_weighted_swiglu_impl(const int* task_queue, uint32_t task_idx,
         const auto prob = probs[row];
 
         // Compute in FP32
+        // NOTES: the IEEE division is worth avoiding, it costs several times the rest of the loop
         const auto* gate = reinterpret_cast<const cutlass::bfloat16_t*>(&gate_vec);
         const auto* up = reinterpret_cast<const cutlass::bfloat16_t*>(&up_vec);
         cutlass::bfloat16_t out[kNumElemsPerAccess];
@@ -72,7 +73,7 @@ smxx_chunk_weighted_swiglu_impl(const int* task_queue, uint32_t task_idx,
         for (uint32_t i = 0; i < kNumElemsPerAccess; ++ i) {
             const auto g = static_cast<float>(gate[i]);
             const auto u = static_cast<float>(up[i]);
-            out[i] = static_cast<cutlass::bfloat16_t>(g / (1.0f + __expf(-g)) * u * prob);
+            out[i] = static_cast<cutlass::bfloat16_t>(__fdividef(g, 1.0f + __expf(-g)) * u * prob);
         }
         *reinterpret_cast<vec_t*>(out_ptr) = *reinterpret_cast<const vec_t*>(out);
     }

@@ -16,10 +16,16 @@ namespace deep_gemm::overlap {
 // Chunk-wise BF16 GEMM for the fine-grained compute-communication overlap
 // Shape must be `[M, K] @ [G, K, N]`, where the task queue holds
 // `[expert_idx, m_start, m_size, ready]` per task, and one call computes one task
+// NOTES: passing `o2` and `probs` fuses the weighted SwiGLU into the epilogue, which needs
+//        `b`'s columns interleaved in groups of 64, i.e. `[gate[0:64], up[0:64], gate[64:128], ...]`,
+//        so that one `BLOCK_N` tile holds both halves of the same 64 activation channels;
+//        `d` then keeps the linear output (in that interleaved order) for the backward pass
 static void bf16_chunk_gemm_nn(const torch::Tensor& a, const torch::Tensor& b,
                                const torch::Tensor& d,
                                const torch::Tensor& task_queue,
                                const int& task_idx,
+                               const std::optional<torch::Tensor>& o2,
+                               const std::optional<torch::Tensor>& probs,
                                const std::string& compiled_dims) {
     // Transpose into `[G, N, K].mT`
     const auto& b_t = b.transpose(1, 2);
@@ -46,11 +52,22 @@ static void bf16_chunk_gemm_nn(const torch::Tensor& a, const torch::Tensor& b,
     // D must be N-major
     check_major_type_cd(d);
 
+    // The fused SwiGLU halves N, and its output shares the row indexing with `d`
+    if (o2.has_value()) {
+        const auto [m__, n_half] = get_shape<2>(o2.value());
+        DG_HOST_ASSERT(m == m__ and n == n_half * 2 and n % 128 == 0);
+        DG_HOST_ASSERT(o2.value().scalar_type() == torch::kBFloat16);
+        check_major_type_cd(o2.value());
+        DG_HOST_ASSERT(probs.has_value());
+        DG_HOST_ASSERT(probs.value().scalar_type() == torch::kFloat);
+        DG_HOST_ASSERT(static_cast<int>(probs.value().numel()) == m and probs.value().is_contiguous());
+    }
+
     // Dispatch implementation
     const auto arch_major = device_runtime->get_arch_major();
     DG_HOST_ASSERT(arch_major == 10 and "Chunk GEMM only supports SM100 for now");
     sm100_bf16_chunk_gemm(a, b_t, d, task_queue, task_idx,
-                          num_groups, m, n, k, major_a, major_b, compiled_dims);
+                          num_groups, m, n, k, major_a, major_b, compiled_dims, o2, probs);
 }
 
 // Weighted SwiGLU for one chunk task: `o2 = silu(o1[:, :N]) * o1[:, N:] * probs`
@@ -116,6 +133,7 @@ static void register_apis(pybind11::module_& m) {
     m.def("bf16_chunk_gemm_nn", &bf16_chunk_gemm_nn,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("task_queue"), py::arg("task_idx"),
+          py::arg("o2") = std::nullopt, py::arg("probs") = std::nullopt,
           py::arg("compiled_dims") = "nk");
     m.def("chunk_weighted_swiglu", &chunk_weighted_swiglu,
           py::arg("o1"), py::arg("probs"), py::arg("o2"),

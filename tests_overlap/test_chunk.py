@@ -29,6 +29,8 @@ I = 2048
 CHUNK = 4096
 NUM_SMS = 96
 ALIGNMENT = 128
+GROUP = 64          # the gate/up interleave granularity required by the fused epilogue
+FUSE_SWIGLU = True  # fuse the SwiGLU into the gate-up epilogue instead of a second kernel
 
 
 def parse_args():
@@ -103,12 +105,31 @@ def make_task_queue(counts, m_start, ready, seed=0):
     return paddle.to_tensor(queue, dtype="int32")
 
 
+def interleave_gateup(w_gateup):
+    """`[gate | up]` -> `[gate[0:64], up[0:64], ...]` per expert, what the fused epilogue needs."""
+    perm = []
+    for start in range(0, I, GROUP):
+        perm.extend(range(start, start + GROUP))
+        perm.extend(range(I + start, I + start + GROUP))
+    perm = paddle.to_tensor(np.asarray(perm, dtype=np.int32))
+    return w_gateup.index_select(perm, axis=2).contiguous()
+
+
+def split_gate_up(o1):
+    """The gate/up halves of `o1`, whatever column order the weight was in."""
+    if FUSE_SWIGLU:
+        blocks = o1.reshape([o1.shape[0], I // GROUP, 2, GROUP])
+        return blocks[:, :, 0].reshape([-1, I]), blocks[:, :, 1].reshape([-1, I])
+    return o1[:, :I], o1[:, I:]
+
+
 def reference(x, w_gateup, w_down, probs, m_indices, correctness=True):
     o1 = paddle.empty([x.shape[0], 2 * I], dtype="bfloat16")
     deep_gemm.m_grouped_bf16_gemm_nn_contiguous(x, w_gateup, o1, m_indices)
 
     if correctness:
-        gate, up = o1[:, :I].float(), o1[:, I:].float()
+        gate, up = split_gate_up(o1)
+        gate, up = gate.float(), up.float()
         o2 = (F.silu(gate) * up * probs.unsqueeze(-1)).astype("bfloat16")
     else:
         # 仅模拟 swiglu 融合算子的访存带宽，用于测试性能
@@ -133,8 +154,11 @@ def reference_gateup_chunk(buffers, tasks):
 def compute_chunk(task_idx, buffers, task_queue):
     """The (gateup, swiglu, down, signal) group of one chunk, all claiming the same task."""
     x, w_gateup, w_down, probs, o1, o2, o3, row_to_token, token_done = buffers
-    deep_gemm.bf16_chunk_gemm_nn(x, w_gateup, o1, task_queue, task_idx)
-    deep_gemm.chunk_weighted_swiglu(o1, probs, o2, task_queue, task_idx)
+    if FUSE_SWIGLU:
+        deep_gemm.bf16_chunk_gemm_nn(x, w_gateup, o1, task_queue, task_idx, o2=o2, probs=probs)
+    else:
+        deep_gemm.bf16_chunk_gemm_nn(x, w_gateup, o1, task_queue, task_idx)
+        deep_gemm.chunk_weighted_swiglu(o1, probs, o2, task_queue, task_idx)
     deep_gemm.bf16_chunk_gemm_nn(o2, w_down, o3, task_queue, task_idx)
     deep_gemm.chunk_signal_token_done(row_to_token, token_done, task_queue, task_idx)
 
@@ -158,6 +182,9 @@ def main():
     probs = paddle.rand([m_total], "float32")
     row_to_token = paddle.to_tensor(row_to_token_np)
     m_indices = paddle.to_tensor(m_indices_np)
+
+    if FUSE_SWIGLU:
+        w_gateup = interleave_gateup(w_gateup)
 
     deep_gemm.set_num_sms(NUM_SMS)
     o1_ref, o2_ref, o3_ref = reference(x, w_gateup, w_down, probs, m_indices)

@@ -27,6 +27,12 @@ public:
 
         // Only used by the chunk layout: which task of the queue this launch claims
         uint32_t task_idx = 0;
+
+        // Only used by the fused SwiGLU epilogue: the activation output and the router scores
+        void* fused_probs = nullptr;
+        void* fused_o2 = nullptr;
+        uint32_t fused_ld_o2 = 0;
+        bool with_fused_swiglu = false;
     };
 
     static std::string generate_impl(const Args& args) {
@@ -50,6 +56,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {}, {}, {},
+        {},
         {}
     >);
 }};
@@ -68,7 +75,8 @@ static void __instantiate_kernel() {{
         heuristics_runtime->get_mk_alignment_for_contiguous_layout(),
         args.gemm_config.layout.swap_ab, args.gemm_desc.ensure_zero_padding,
         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation, to_string(args.gemm_desc.cd_dtype),
-        args.gemm_desc.tc_util);
+        args.gemm_desc.tc_util,
+        args.with_fused_swiglu);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -76,6 +84,7 @@ static void __instantiate_kernel() {{
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.grouped_layout, args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
             args.task_idx,
+            args.fused_probs, args.fused_o2, args.fused_ld_o2,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_cd));
     }
@@ -206,6 +215,8 @@ static void sm100_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
 // One launch computes exactly one chunk task, claimed from `task_queue` by `task_idx`
 // NOTES: `A`/`D` use the whole contiguous (128-aligned) unzipped layout, and the task
 //        descriptor tells the kernel which row range and which expert to use
+// NOTES: with `o2`/`probs` given, the weighted SwiGLU is fused into the epilogue, which
+//        requires `b` to be interleaved in 64-column groups
 static void sm100_bf16_chunk_gemm(const torch::Tensor& a,
                                   const torch::Tensor& b,
                                   const torch::Tensor& d,
@@ -213,7 +224,9 @@ static void sm100_bf16_chunk_gemm(const torch::Tensor& a,
                                   const int& task_idx,
                                   const int& num_groups, const int& m, const int& n, const int& k,
                                   const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                  const std::string& compiled_dims) {
+                                  const std::string& compiled_dims,
+                                  const std::optional<torch::Tensor>& o2 = std::nullopt,
+                                  const std::optional<torch::Tensor>& probs = std::nullopt) {
     const auto desc = GemmDesc {
         .gemm_type = GemmType::MGroupedChunk,
         .kernel_type = KernelType::KernelNoSF,
@@ -229,6 +242,10 @@ static void sm100_bf16_chunk_gemm(const torch::Tensor& a,
 
     // The chunk's row offset must be block-M aligned, as the scheduler shifts whole M blocks
     DG_HOST_ASSERT(heuristics_runtime->get_mk_alignment_for_contiguous_layout() == config.layout.block_m);
+
+    // The fused epilogue reads the gate/up pair out of the staged `[STORE_BLOCK_M, 128]` tile
+    if (o2.has_value())
+        DG_HOST_ASSERT(config.layout.swap_ab and config.layout.block_n == 128);
 
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                               config.storage_config.load_block_m,
@@ -247,6 +264,7 @@ static void sm100_bf16_chunk_gemm(const torch::Tensor& a,
                                                 config.storage_config.swizzle_cd_mode);
 
     // Launch
+    const auto with_fused_swiglu = o2.has_value();
     const SM100BF16GemmRuntime::Args args = {
         .gemm_desc = desc,
         .gemm_config = config,
@@ -257,10 +275,15 @@ static void sm100_bf16_chunk_gemm(const torch::Tensor& a,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd,
-        .task_idx = static_cast<uint32_t>(task_idx)
+        .task_idx = static_cast<uint32_t>(task_idx),
+        .fused_probs = with_fused_swiglu ? probs.value().data_ptr() : nullptr,
+        .fused_o2 = with_fused_swiglu ? o2.value().data_ptr() : nullptr,
+        .fused_ld_o2 = with_fused_swiglu ? static_cast<uint32_t>(o2.value().stride(-2)) : 0,
+        .with_fused_swiglu = with_fused_swiglu
     };
     const auto code = SM100BF16GemmRuntime::generate(args);
-    const auto runtime = compiler->build("sm100_bf16_chunk_gemm", code);
+    const auto runtime = compiler->build(
+        with_fused_swiglu ? "sm100_bf16_chunk_gemm_fused_swiglu" : "sm100_bf16_chunk_gemm", code);
     SM100BF16GemmRuntime::launch(runtime, args);
 }
 
