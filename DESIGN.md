@@ -26,9 +26,9 @@
   * 目前已由其他组同事完成 chunk 到达信号记录的实现，也就是显存上有一个队列，记录当前收到的 (expert_id, chunk_id) 序列，但 kernel 还在调试还没给到我，开发时可以自己写一个队列在单卡模拟这种情况，这样也方便单卡调试
 
 3. 计算部分，使用 DeepGEMM 的 bf16 矩阵乘 + 自己实现的 swiglu，具体调用方法为：
-  * 由于 n_chunks 在计算开始前已知，所以在开始时 CPU 直接往计算流发射 n_chunks 组 (gateup, swiglu, down) 算子（也就是一共 n_chunks*3 个算子）
+  * 由于 n_chunks 在计算开始前已知，所以在开始时 CPU 直接往计算流发射 n_chunks 组 (gateup, swiglu, down, done) 算子（也就是一共 n_chunks\*4 个算子，融合 gateup+swiglu 的话就是 n_chunks*3）
   * 每个算子的输入指针不指定，靠从队列里获取，由于计算流内部天然阻塞，所以不存在一个算子抢另一个算子的任务的情况，任务一定是一个一个完成，最后恰好 n_chunks 组算子做完所有任务
-  * 每组算子完成任务后，往一个表记录每个 token 的完成情况（已经被几个专家完成）
+  * 每组算子完成任务后，首先往一个表记录每个 token 的完成情况（已经被几个专家完成），对于已经被所有专家完成的 token 即可发往下一步；由于这个 “记录” 操作和 gemm 不好融合，所以新增一个 done 算子来进行记录和入队操作
 
 4. zip 与 combine 部分，zip 是一个单独的 persistent kernel，combine 也使用 DeepEP，增加信号等待逻辑：
   * zip 通过读计算完成队列，对于一个不重复 token，当它 topk 的所有专家都计算完就对其进行求和操作，写到 combine 的输入 buffer
@@ -48,11 +48,11 @@
 
 目前 gateup 和 down 想用 deep_gemm.bf16_gemm_nn 这个接口对应的底层算子（我没仔细看代码，但是实测性能很好，对于 chunk=4096、16个专家、平均每个专家8192个 token 的场景，它只比调用单个 group_gemm 慢了3%）
 
-我知道 deepgemm 是支持动态M的，它可以在领任务的时候才知道M是多少，NK肯定是launch时已知的；当然我不清楚动态M对性能影响多大，需要根据测试决定是用动态M还是总是向chunk对齐允许浪费
+deep_gemm 是支持动态 M 的，它可以在领任务的时候才知道 M 是多少，NK 则是 launch 时已知的；动态 M 对性能影响很小，我们用动态 M 可以让专家的余数部分避免冗余计算
 
-swiglu 就新实现一个就行，我们实际用的是 weighted_swiglu，就是 router_score 在这里乘进去，paddle 原有算子不支持动态 M，所以需要新写一个
+需要实现一个新的 swiglu 或直接将 swiglu 融合到 gateup 的 epilogue；我们的模型算法实际用的是 weighted_swiglu，就是 router_score 在这里乘进去而不是在 zip 的时候；由于 Paddle 原有算子不支持动态 M，需要新写一个
 
-计算kernel都需要使用persistent的形式，就是使用固定数量的SM，SM自己分配任务；目前安排的是计算流（gateup+swiglu+down）用 96SM，其他是给通信和zip用的；大家统一用2-CTA形式，这样launch不会导致1-CTA和2-CTA之间冲突，其实官方DeepEP早就默认是2-CTA了，反而计算这边很多kernel迟迟没跟进
+计算 kernel 都需要使用 persistent 的形式，就是使用固定数量的 SM，SM 自己分配任务；目前安排的是计算流（gateup+swiglu+down+done）用 96SM，其他是给通信和 zip 用的；大家统一用 2-CTA 形式，这样 launch 不会导致 1-CTA 和 2-CTA 之间冲突，其实官方 DeepEP 早就默认是 2-CTA 了，反而计算这边很多 kernel 迟迟没跟进
 
 
 ### buffer设计
@@ -63,6 +63,12 @@ swiglu 就新实现一个就行，我们实际用的是 weighted_swiglu，就是
 `num_experts`：每个 rank 上的专家数（即本地专家数）
 `tokens_per_expert[num_experts]`：dispatch 后当前 rank 上每个 expert 收到的 token 数量，是一个数组
 `num_unzipped_tokens`：sum((n + 127) // 128 * 128 for n in tokens_per_expert)，也就是向 128 对齐后的展开的总 token 数，向 128 对齐是 GEMM 的固有要求
+
+对 token 在 buffer 中的顺序消歧义如下：
+`sequence序`：dispatch 之前的 token 顺序，也就是 hidden_states 中的顺序，确定性
+`DeepEP序`：原版 DeepEP dispatch 收到不重复 token 的顺序，combine 的输入也用该顺序，确定性
+`前向atomic序`：前向 dispatch + unzip 后得到的顺序，由于使用了 atomic 先到先放，非确定
+`反向atomic序`：反向 dispatch + unzip 后得到的顺序，同样非确定，且和前向的顺序不一样，因此在一次前反向中其实存在两种不同的随机顺序
 
 GEMM 的输入这边仍然沿用原来的 unzip 输出的 buffer 设计，里面每个专家的 token 连续排列，即前 tokens_per_expert[0] 个 token 是专家0的，**向128对齐后**，接下来的 tokens_per_expert[1] 个 token 是专家1的，以此类推
 * `unzipped_tokens`[num_unzipped_tokens, hidden_size] bf16
@@ -80,10 +86,23 @@ GEMM 的输入这边仍然沿用原来的 unzip 输出的 buffer 设计，里面
 
 ### 信号设计
 
-目前通信和计算之间的信号 buffer 的设计还没定，通信那边也都未定稿，我们开发时自己先定义一套就行，我们这边保证我们的 acquire/release 语义是正确的就行
+目前通信和计算之间的信号 buffer 的设计还在迭代中，只定义了当前开发阶段所需的，如果发现有需要可以继续新增
+我们需要保证我们这边保证我们的 acquire/release 语义是正确的，通信那边也会保证正确的语义
 
-和原来串行方式对比的话，相当于原来是 unzipped_tokens 已经完全就绪才开始算 gateup，现在是 unzipped_tokens 里面随机的某个专家的 chunk 先到，哪个专家先到不确定，但是一个专家内一定是 chunk0->chunk1->chunk2 这样的顺序，这个通信那边已经保证了
+dispatch 给到计算的除了 unzipped_tokens 和 unzipped_probs，还有一个任务队列：
+`task_queue`[num_chunks, 4] int32 : 记录每个 chunk 的描述符和就绪信号，格式为 [expert_idx, m_start, m_size, ready]
+* num_chunks 是可以提前算出来的，因为 dispatch 开始前就已经知道 tokens_per_expert，则 num_chunks = sum(ceil(n / chunk) for n in tokens_per_expert)
+* expert_idx 是该 chunk 属于哪个本地专家
+* m_start 是该 chunk 在 unzipped_tokens 里的偏移 token 数
+* m_size 是 chunk 包含的 token 数，一般为 chunk 大小，但对于一个专家的余数部分是可以小于 chunk 大小的，计算这边用了动态 M 的 kernel
+* 该队列是一个 FIFO 队列，ready 的任务会按顺序连续 push 进来，计算这边也使用递增方式按顺序等待 ready 信号即可
 
-我们计算要做的就是当一个 chunk 就绪时，立即做它的 gateup+swiglu+down，然后更新输出的完成信号给后面的 kernel 用
+dispatch 给了一张映射表用于前向 atomic 序向 DeepEP 序的转换，该表随着 receiver 更新，收到 token 后才赋值，当然我们读到 ready 时说明这个 chunk 内所有 token 的信息都就绪了：
+`atomic_to_zip`[num_unzipped_tokens] int32 : 使用 atomic 序，记录一个 token 指向 DeepEP 序里的哪个下标，padding 位置填 -1
 
-由于 unzipped_tokens->o1->o2->o3 都是一样的布局，输入是第几个 token 输出就写到第几个 token 的位置，无需任何转换
+为了让 zip 算子知道每个 token 的有效 topk 数，dispatch 还会给一张计数表，同样是随 ready 动态更新的：
+`num_valid_topk`[num_recv_tokens] int32 : 使用 DeepEP 序，记录每个 token 在本地有几个专家，其值等价于**通信完成后** recv_token_indices 里面每行非 -1 的数量，但是在运行时不相等，因为 recv_token_indices 的一行是分专家更新的，一个 chunk 就绪时只保证这个 chunk 所属专家在 recv_token_indices 里面的槽位就绪，不保证这一行所有专家都就绪，导致数少了；num_valid_topk 则是通过冗余更新解决这个问题，一个 token 的每个专家的 chunk 发布时都会重新写一次 topk 值
+
+done 算子需要维护以下两张表用于记录 token 完成情况：
+`token_done`[num_recv_tokens] int32 : 使用 DeepEP 序，当一个 token 的计数等于 num_valid_topk 里的对应值时，说明它被所有专家计算完了，就可以进行 zip 了；这张表只在计算内部用，不需要给通信
+`zip_task_queue`[num_recv_tokens] int32 : 是一个连续填充的队列，内容为计算完的 token 在 DeepEP 序中的下标，完成的 token 会被依次 push 进来；该队列初始值为 -1，这样当读到非 -1 的值时就知道就绪了，不需要额外 ready 信号；该队列会给到通信
