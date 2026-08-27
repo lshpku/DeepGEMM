@@ -80,4 +80,15 @@ python tests_overlap/test_fused_swiglu.py
 * 现状（m=4096, H=4096, I=2048, 96 SM）：纯 gateup 111us，融合版 113.6us，独立 swiglu 还要 26us；独立 kernel 只跑到 1.96 TB/s，仍然是延迟受限（每线程 in-flight 太少），但既然融合几乎免费就不再优化它
 * 下一步：把融合接到 chunk 版 GEMM（`MGroupedChunk`）上，o2 换成 chunk 大小的复用 buffer，并把交错权重的准备放到上层
 
+8.27: done 算子扩充成完整的完成信号发布，直接给出 zip 要的 `zip_task_queue`
+* API 变为 `chunk_signal_token_done(atomic_to_zip, num_valid_topk, token_done, zip_task_queue, zip_queue_tail, task_queue, task_idx)`，原 `row_to_token` 按 DESIGN 统一改名 `atomic_to_zip`
+* 判定"我是最后一个专家"必须用带返回值的原子加（新增 `ptx::atomic_add(int*)`，`atom.gpu.global.add.s32`），按 `old + 1 == num_valid_topk[token]` 判断：只有一个线程能看到相等，所以每个 token 恰好 push 一次。原来的 `red.release` 拿不到返回值，用不了
+* 队列不需要额外的 ready 列：payload 只有一个 int，单次 4B store 天然原子，队列初始化为 -1，读到非 -1 即就绪。抢槽位用一个 int32 `zip_queue_tail` 做 `atomicAdd`，是纯计算侧的内部状态，不给通信
+* 但单靠一个 tail 指针不行：抢槽位有序而写 payload 无序，zip 看到 tail 前移时对应的 slot 可能还没落盘，所以"值自己当 ready"这一层是必须的
+* 内存序只在 push 那一次 store 用 `.release.sys`：所有 chunk 都在同一条计算流上串行，一个 token 其余专家的 o3 早在本 kernel 启动前就写完了，所以计数器本身用 relaxed 就够，不需要用 acq_rel 去接别人的 release
+* `num_valid_topk` / `atomic_to_zip` 用普通 load 读：CTA 里 0 号线程对 `ready` 的 `ld.acquire` 已经给全 CTA 建立了顺序，且这个 chunk 的表项之后不再变（`num_valid_topk` 是冗余重写同一个最终值，幂等）
+* 测试侧：三张信号表每轮都要重置（`token_done` 清 0、`zip_task_queue` 清 -1、`tail` 清 0），性能循环里重复跑同一批 chunk 会把计数叠加到超过 `num_valid_topk` 而触发 assert
+* 结果：`--check-signal` 通过（39 chunk / 109707 token，逐 chunk 校验队列内容和 `token_done` 完全一致，最终队列恰好是全部 token 的一个排列），`--arrival ready/cpu` 通过
+* 遗留：`--arrival gpu` 在 launch producer 时报 719（unspecified launch failure）。确认与本次改动无关——把 done 算子整个去掉、或关掉 swiglu 融合都一样失败，而 producer kernel 单独跑正常，怀疑和计算 kernel 全部卡在 spin-wait 时再往另一条流 launch 有关，待查
+
 

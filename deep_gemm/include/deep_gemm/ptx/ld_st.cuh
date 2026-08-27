@@ -244,6 +244,12 @@ CUTLASS_DEVICE uint32_t atomic_add_rel(const uint32_t* ptr, const uint32_t& valu
     return ret;
 }
 
+CUTLASS_DEVICE int atomic_add(const int* ptr, const int& value) {
+    int ret;
+    asm volatile("atom.gpu.global.add.s32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value));
+    return ret;
+}
+
 CUTLASS_DEVICE void red_add(const int* ptr, const int& value) {
     asm volatile("red.gpu.global.add.s32 [%0], %1;" :: "l"(ptr), "r"(value));
 }
