@@ -58,17 +58,4 @@ CUTLASS_DEVICE ChunkTask load_staged_task(const int* staged) {
     return {staged[0], staged[1], staged[2]};
 }
 
-// Publish the arrival of a chunk, i.e. what the communication kernel does
-CUTLASS_DEVICE void set_task_ready(int* task_queue, const uint32_t& task_idx) {
-    ptx::st_rel_sys(task_queue + task_idx * kNumChunkTaskFields + 3, 1);
-}
-
-// Wait for a given number of SM cycles, polling instead of busy-spinning
-// NOTES: `nanosleep` alone overshoots badly when chained, so the clock decides when to stop
-CUTLASS_DEVICE void wait_cycles(uint64_t cycles) {
-    const auto start_clock = clock64();
-    while (static_cast<uint64_t>(clock64() - start_clock) < cycles)
-        __nanosleep(kPollIntervalNs);
-}
-
 } // namespace deep_gemm::chunk

@@ -4,7 +4,6 @@
 
 #if DG_TENSORMAP_COMPATIBLE
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
-#include "../jit_kernels/impls/smxx_chunk_arrival_sim.hpp"
 #include "../jit_kernels/impls/smxx_chunk_token_done.hpp"
 #include "../jit_kernels/impls/smxx_chunk_weighted_swiglu.hpp"
 #endif
@@ -133,17 +132,6 @@ static void chunk_signal_token_done(const torch::Tensor& atomic_to_zip,
                           zip_task_queue, zip_queue_tail, task_queue, task_idx);
 }
 
-// Mark the chunks as arrived one by one, standing in for the communication kernel
-// NOTES: for single-card debugging only, and it must run on another stream to overlap
-static void simulate_chunk_arrival(const torch::Tensor& task_queue, const int& interval_ns) {
-    DG_HOST_ASSERT(task_queue.is_contiguous());
-    DG_HOST_ASSERT(task_queue.scalar_type() == torch::kInt);
-    DG_HOST_ASSERT(task_queue.dim() == 2 and task_queue.size(1) == kNumChunkTaskFields);
-    DG_HOST_ASSERT(interval_ns >= 0);
-
-    smxx_chunk_arrival_sim(task_queue, interval_ns);
-}
-
 #endif
 
 static void register_apis(pybind11::module_& m) {
@@ -156,8 +144,6 @@ static void register_apis(pybind11::module_& m) {
     m.def("chunk_weighted_swiglu", &chunk_weighted_swiglu,
           py::arg("o1"), py::arg("probs"), py::arg("o2"),
           py::arg("task_queue"), py::arg("task_idx"));
-    m.def("simulate_chunk_arrival", &simulate_chunk_arrival,
-          py::arg("task_queue"), py::arg("interval_ns"));
     m.def("chunk_signal_token_done", &chunk_signal_token_done,
           py::arg("atomic_to_zip"), py::arg("num_valid_topk"), py::arg("token_done"),
           py::arg("zip_task_queue"), py::arg("zip_queue_tail"),

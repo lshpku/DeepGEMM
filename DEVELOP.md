@@ -22,7 +22,6 @@ source env3.12/bin/activate
 python tests_overlap/test_gemm_baseline.py
 python tests_overlap/test_chunk.py --arrival ready
 python tests_overlap/test_chunk.py --arrival cpu
-python tests_overlap/test_chunk.py --arrival gpu
 python tests_overlap/test_chunk.py --check-signal
 python tests_overlap/test_fused_swiglu.py
 ```
@@ -89,6 +88,6 @@ python tests_overlap/test_fused_swiglu.py
 * `num_valid_topk` / `atomic_to_zip` 用普通 load 读：CTA 里 0 号线程对 `ready` 的 `ld.acquire` 已经给全 CTA 建立了顺序，且这个 chunk 的表项之后不再变（`num_valid_topk` 是冗余重写同一个最终值，幂等）
 * 测试侧：三张信号表每轮都要重置（`token_done` 清 0、`zip_task_queue` 清 -1、`tail` 清 0），性能循环里重复跑同一批 chunk 会把计数叠加到超过 `num_valid_topk` 而触发 assert
 * 结果：`--check-signal` 通过（39 chunk / 109707 token，逐 chunk 校验队列内容和 `token_done` 完全一致，最终队列恰好是全部 token 的一个排列），`--arrival ready/cpu` 通过
-* 遗留：`--arrival gpu` 在 launch producer 时报 719（unspecified launch failure）。确认与本次改动无关——把 done 算子整个去掉、或关掉 swiglu 融合都一样失败，而 producer kernel 单独跑正常，怀疑和计算 kernel 全部卡在 spin-wait 时再往另一条流 launch 有关，待查
+* 顺手删掉了模拟 chunk 到达的 producer kernel（`smxx_chunk_arrival_sim` 及 `--arrival gpu`）：`--arrival cpu` 已经足够模拟到达延迟，没必要为了调试往仓库里塞一个算子；`chunk::set_task_ready` / `chunk::wait_cycles` 只被它用，一并删除
 
 

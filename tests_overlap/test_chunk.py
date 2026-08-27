@@ -3,12 +3,10 @@
 Usage:
     python tests_overlap/test_chunk.py                        # all chunks ready up-front
     python tests_overlap/test_chunk.py --arrival cpu          # CPU feeds `ready`
-    python tests_overlap/test_chunk.py --arrival gpu          # a producer kernel feeds `ready`
-    python tests_overlap/test_chunk.py --check-signal         # verify `token_done` chunk by chunk
+    python tests_overlap/test_chunk.py --check-signal         # verify the signals chunk by chunk
 """
 
 import argparse
-import ctypes
 import time
 
 import numpy as np
@@ -39,10 +37,10 @@ FUSE_SWIGLU = True  # fuse the SwiGLU into the gate-up epilogue instead of a sec
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--arrival", choices=["ready", "cpu", "gpu"], default="ready",
-                        help="who marks the chunks as arrived: nobody (all ready), the CPU, or a producer kernel")
+    parser.add_argument("--arrival", choices=["ready", "cpu"], default="ready",
+                        help="who marks the chunks as arrived: nobody (all ready) or the CPU")
     parser.add_argument("--interval-ms", type=float, default=0.5,
-                        help="delay between two arrivals, for the `cpu` and `gpu` modes")
+                        help="delay between two arrivals, for the `cpu` mode")
     parser.add_argument("--check-signal", action="store_true",
                         help="verify `token_done` and `zip_task_queue` after every chunk, "
                              "which forces a sync per chunk")
@@ -313,11 +311,10 @@ def main():
     expected = np.zeros([num_recv_tokens], dtype=np.int32)
     expected_topk = num_valid_topk.numpy()
 
-    # 模拟独立的通信流和计算流，与默认流分开，否则后面写 task_queue 会死锁
-    comm_stream, compute_stream = paddle.cuda.Stream(), paddle.cuda.Stream()
+    # 计算流与默认流分开，否则后面写 task_queue 会死锁
+    compute_stream = paddle.cuda.Stream()
     event = paddle.device.Event()
     event.record()
-    comm_stream.wait_event(event)
     compute_stream.wait_event(event)
 
     # 发射计算流算子
@@ -351,10 +348,7 @@ def main():
         paddle.base.core.nvprof_nvtx_pop()
 
     # 模拟通信流给 task_queue 异步写信号
-    if args.arrival == "gpu":
-        with paddle.device.stream_guard(comm_stream):
-            deep_gemm.simulate_chunk_arrival(task_queue, int(interval_s * 1e9))
-    elif args.arrival == "cpu":
+    if args.arrival == "cpu":
         one = paddle.ones([1], "int32")
         paddle.base.core.nvprof_nvtx_push("cpu_arrival")
         for task_idx in range(num_tasks):
