@@ -90,4 +90,15 @@ python tests_overlap/test_fused_swiglu.py
 * 结果：`--check-signal` 通过（39 chunk / 109707 token，逐 chunk 校验队列内容和 `token_done` 完全一致，最终队列恰好是全部 token 的一个排列），`--arrival ready/cpu` 通过
 * 顺手删掉了模拟 chunk 到达的 producer kernel（`smxx_chunk_arrival_sim` 及 `--arrival gpu`）：`--arrival cpu` 已经足够模拟到达延迟，没必要为了调试往仓库里塞一个算子；`chunk::set_task_ready` / `chunk::wait_cycles` 只被它用，一并删除
 
+8.27: 独立 swiglu kernel 加 `precise` 开关，并把它从 2.1 TB/s 优化到 4.7 TB/s
+* `chunk_weighted_swiglu(..., precise=False)`：`precise=True` 走 `expf` + IEEE 除法（和线上 ernie 融合算子同一个写法），默认仍是 `__fdividef` + `__expf`
+* 精度实测（m=4096, I=2048, 对 fp64 真值舍入到 bf16 比对）：快速版 134/8388608 个元素不一致，精确版 141，paddle `F.silu` 链路 143 —— 三者在 bf16 输出上没有可分辨的优劣，所以 `precise` 只用于需要复现特定算子逐位结果的场合。代价 11us → 17us
+* 注意精确版也**不能**和 paddle python 的 `F.silu` 逐位对上（仍有 42/8388608 不一致），说明 paddle 自己的 silu kernel 和这个写法也有差异，不要把 `precise=True` 当成"和 paddle 对齐"
+* 性能问题的根因是访存不连续 + 占用太低，不是算术：
+  * 原来一个线程连续吃 4 个 vec 时，warp 内相邻线程地址差 64B，每条指令只用到取回 sector 的一部分；改成"一个线程的多个 vec 相隔一整个 grid stride"，每条指令仍是 32×16B 连续，同时保留多个 load in-flight
+  * `__launch_bounds__(kNumThreads, 1)` 让每个 SM 只有一个 block，256 线程/SM 只有 8 个 warp，延迟根本藏不住；加到 1024 线程后 32 warp/SM
+  * 行长 `kNumVecsPerRow` 提成模板参数，flat index 拆行/列时 `/` 和 `%` 对 2 的幂退化成移位，顺带去掉了 `shape_n` 这个运行时参数
+* 参数扫描（m=4096, 96 SM，50.3MB 访存）：1024 线程 + 每线程 2 个 vec 最优 10.8us / 4.66 TB/s；unroll 4 → 15.5us、unroll 8 → 23.0us（寄存器压力），512 线程 → 17.6us、256 线程 → 20.1us
+* 对比：改之前 23.7us / 2.12 TB/s，现在 10.8us / 4.66 TB/s，约 2.2 倍。融合版仍然更优（融合开销约 0），这个 kernel 只在不融合的路径上用
+
 

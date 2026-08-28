@@ -73,7 +73,8 @@ static void bf16_chunk_gemm_nn(const torch::Tensor& a, const torch::Tensor& b,
 static void chunk_weighted_swiglu(const torch::Tensor& o1, const torch::Tensor& probs,
                                   const torch::Tensor& o2,
                                   const torch::Tensor& task_queue,
-                                  const int& task_idx) {
+                                  const int& task_idx,
+                                  const bool& precise) {
     // Type and shape checks
     const auto [m, n2] = get_shape<2>(o1);
     const auto [m_, n] = get_shape<2>(o2);
@@ -90,7 +91,7 @@ static void chunk_weighted_swiglu(const torch::Tensor& o1, const torch::Tensor& 
     DG_HOST_ASSERT(task_queue.dim() == 2 and task_queue.size(1) == kNumChunkTaskFields);
     DG_HOST_ASSERT(0 <= task_idx and task_idx < task_queue.size(0));
 
-    smxx_chunk_weighted_swiglu(o1, probs, o2, task_queue, task_idx);
+    smxx_chunk_weighted_swiglu(o1, probs, o2, task_queue, task_idx, precise);
 }
 
 // Publish the token completion of one chunk, to be issued right after its down GEMM
@@ -143,7 +144,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("compiled_dims") = "nk");
     m.def("chunk_weighted_swiglu", &chunk_weighted_swiglu,
           py::arg("o1"), py::arg("probs"), py::arg("o2"),
-          py::arg("task_queue"), py::arg("task_idx"));
+          py::arg("task_queue"), py::arg("task_idx"),
+          py::arg("precise") = false);
     m.def("chunk_signal_token_done", &chunk_signal_token_done,
           py::arg("atomic_to_zip"), py::arg("num_valid_topk"), py::arg("token_done"),
           py::arg("zip_task_queue"), py::arg("zip_queue_tail"),
