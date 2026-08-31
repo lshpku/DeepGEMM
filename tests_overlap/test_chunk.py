@@ -337,7 +337,7 @@ def main():
 
                 # The queue must hold exactly the tokens whose experts are all done
                 done_tokens = np.flatnonzero(expected == expected_topk)
-                tail = int(zip_queue_tail.numpy()[0])
+                tail = int(zip_queue_tail)
                 pushed = zip_task_queue.numpy()[:tail]
                 assert tail == len(done_tokens), (
                     f"zip_queue_tail {tail} != {len(done_tokens)} after task {task_idx}"
@@ -377,7 +377,7 @@ def main():
     assert np.array_equal(final, expected_topk)
 
     # And every token must have been pushed to `zip` exactly once, with no hole left
-    tail = int(zip_queue_tail.numpy()[0])
+    tail = int(zip_queue_tail)
     pushed = zip_task_queue.numpy()
     print("zip_task_queue: pushed:", tail, "of", num_recv_tokens)
     assert tail == num_recv_tokens, f"zip_queue_tail {tail} != {num_recv_tokens}"

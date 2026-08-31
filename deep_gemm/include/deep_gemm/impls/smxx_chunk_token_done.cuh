@@ -2,6 +2,7 @@
 
 #include <deep_gemm/common/chunk_task.cuh>
 #include <deep_gemm/common/utils.cuh>
+#include <deep_gemm/ptx/utils.cuh>
 
 namespace deep_gemm {
 
@@ -29,6 +30,7 @@ smxx_chunk_token_done_impl(const int* task_queue, uint32_t task_idx,
     const auto task = chunk::load_staged_task(smem_task);
     const auto m_start = static_cast<uint32_t>(task.m_start);
     const auto m_size = static_cast<uint32_t>(task.m_size);
+    const auto lane_idx = ptx::get_lane_idx();
 
     // Persistent: a fixed number of CTAs strides over the chunk's rows
     for (uint32_t i = blockIdx.x * kNumThreads + threadIdx.x; i < m_size; i += kNumSMs * kNumThreads) {
@@ -44,15 +46,23 @@ smxx_chunk_token_done_impl(const int* task_queue, uint32_t task_idx,
             const auto expected = num_valid_topk[token_idx];
             DG_TRAP_ONLY_DEVICE_ASSERT(counted <= expected);
 
-            // Exactly one thread sees the counter reach the token's expert count, so the
-            // token is pushed exactly once, and the slot is claimed before it is filled
-            if (counted == expected) {
-                const auto slot = ptx::atomic_add(zip_queue_tail, 1);
-                DG_TRAP_ONLY_DEVICE_ASSERT(static_cast<uint32_t>(slot) < num_tokens);
+            const unsigned bits = __ballot_sync(0xffffffff, counted == expected);
+            const unsigned lower_mask = (1u << lane_idx) - 1u;
+            const int warp_prefix = __popc(bits & lower_mask);
+            const int warp_count = __popc(bits);
 
-                // Release, so that `zip` seeing the token also sees the down GEMM's output;
-                // the value doubles as the ready flag, as the queue is filled with `-1`
-                ptx::st_rel_sys(zip_task_queue + slot, token_idx);
+            if (bits != 0) {
+                // Only lane 0 does the atomic add; other lanes share the base slot and
+                // add their prefix in the warp to get their own slots.
+                int slot;
+                if (lane_idx == 0) {
+                    slot = ptx::atomic_add(zip_queue_tail, warp_count);
+                    DG_TRAP_ONLY_DEVICE_ASSERT(static_cast<uint32_t>(slot) < num_tokens);
+                }
+                slot = __shfl_sync(0xffffffff, slot, 0);
+                if (counted == expected) {
+                    zip_task_queue[slot + warp_prefix] = token_idx;
+                }
             }
         }
     }
