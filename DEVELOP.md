@@ -24,6 +24,7 @@ python tests_overlap/test_chunk.py --arrival ready
 python tests_overlap/test_chunk.py --arrival cpu
 python tests_overlap/test_chunk.py --check-signal
 python tests_overlap/test_fused_swiglu.py
+python tests_overlap/test_zip.py
 ```
 
 `test_gemm_baseline.py`：对比group_gemm和chunk的性能测试，一个是调用单次group_gemm，一个是分chunk调用，实测性能差距很小，chunk方案仅慢2%，说明分chunk几乎不影响性能
@@ -31,6 +32,8 @@ python tests_overlap/test_fused_swiglu.py
 `test_chunk.py`：chunk 流式全链路（gateup, swiglu, down, signal）的正确性测试。按真实路由构造布局（默认 16384 个不重复 token，topk=8，每专家区域向 128 对齐，所以有真的 padding 行），先在异步流上把全部 kernel 发出去让它们卡在 spin-wait 上，最后与 group_gemm 逐位比对 o1/o2/o3（只比真实行）并检查 `token_done` 每个 token 恰好被记 topk 次。
 
 `test_fused_swiglu.py`：单算子测试，验证把 weighted SwiGLU 融进 gateup epilogue 的正确性（o1/o2 都与两 kernel 路径逐位一致）和代价（融合只多 2us，独立 swiglu kernel 要 26us）
+
+`test_zip.py`：融合 zip 算子（done+zip）的正确性测试。按真实路由构造 4096 个不重复 token、topk=8、专家区域向 128 对齐的 o3（atomic 序，行内乱序），用乱序 task_queue 逐 chunk 调 `chunk_zip`，与 `paddle.nn.functional.moe_unpermute` 逐位比对 `combine_input`，并检查 `zip_done` 全 1、`token_done` 恰好等于 `num_valid_topk`。三组 `(num_sms, chunk)` 配置覆盖每专家单 chunk、多 chunk + 余数 chunk、以及 CTA 本地队列被压满的情况，三种不同的到达顺序给出逐位相同的结果，即验证了确定性
 
 
 ## 开发进展
@@ -100,5 +103,20 @@ python tests_overlap/test_fused_swiglu.py
   * 行长 `kNumVecsPerRow` 提成模板参数，flat index 拆行/列时 `/` 和 `%` 对 2 的幂退化成移位，顺带去掉了 `shape_n` 这个运行时参数
 * 参数扫描（m=4096, 96 SM，50.3MB 访存）：1024 线程 + 每线程 2 个 vec 最优 10.8us / 4.66 TB/s；unroll 4 → 15.5us、unroll 8 → 23.0us（寄存器压力），512 线程 → 17.6us、256 线程 → 20.1us
 * 对比：改之前 23.7us / 2.12 TB/s，现在 10.8us / 4.66 TB/s，约 2.2 倍。融合版仍然更优（融合开销约 0），这个 kernel 只在不融合的路径上用
+
+
+9.1: 新增 `chunk_zip`，把 zip 融进计算流的 done 算子，替代 `chunk_signal_token_done` + 独立 persistent zip 的组合
+* API 为 `chunk_zip(o3, combine_input, atomic_to_zip, zip_to_atomic, recv_token_indices, num_valid_topk, token_done, zip_done, task_queue, task_idx, chunk_size)`；`combine_input` / `zip_done` 都是原地更新的入参，`zip_task_queue` / `zip_queue_tail` 整个不再需要
+* 两步走：第一步全 CTA 分摊本 chunk 的行做计数（和原 done 算子一样），命中"最后一个专家"的 token 用 smem atomic 抢槽位入 CTA 本地队列；`__syncthreads` 后第二步每个 warp 领一个 token 做求和
+* 行划分按 `ceil_div(m_size, num_sms)` 在 kernel 里现算，**只有 smem 队列容量**用 `next_pow2(ceil_div(chunk_size, num_sms))`：如果按最大 chunk 静态定 64 行/SM，chunk=4096 时只有 64 个 SM 有活干，而每个专家的余数 chunk 更是只能用到几个 SM
+* 线程数取 512（16 warp）而不是提案里的 256：这个 kernel 和独立 swiglu 一样是纯访存受限，8 warp/SM 藏不住延迟（见 8.27 那条的实测）
+* 求和顺序取专家下标升序（`recv_token_indices` 是唯一能给出专家下标的表），这是唯一不依赖到达顺序的顺序；warp 内用 `__ballot_sync` + 比较计 rank 完成排序，落到 smem 的 `[kNumWarps][kNumTopk]` 上；一个槽位是否有效只认 `zip_to_atomic`，`recv_token_indices` 的无效槽位可能是垃圾
+* 累加在 fp32 做，借鉴通信侧调过的那版 zip：每个 lane 每步吃 4 个 `int4`（`base + l`、`base + 32 + l`、……，每个 load 仍是 32 lane 全合并的一笔），累加器用 `float2` 数组配合 `ptx::accumulate`（`add.rn.f32.bf16`，一次吃一个 `bfloat162`），输出用 `__float22bfloat162_rn` 只舍入一次；hidden 不是整数个 step 时走标量尾巴，step 循环里不能有任何按 `k` 的判断，否则 unroll 失效、累加器被动态下标索引而 spill 到 local memory
+* 不在 `combine_input` 上做 bf16 读-改-写，那样既掉精度又多一倍访存
+* 实测 `cuobjdump -res-usage`：REG:90、STACK/LOCAL 全 0（无 spill），SASS 里是 4 条 `LDG.E.128.CONSTANT` + 4 条 `STG.E.128`；线程数保持 512，1024 的话每线程只剩 64 寄存器，这个 `float2[4][4]` 累加器会 spill
+* 融合掉了 zip 侧所有的 acquire：一个 token 其余专家一定属于更早的 chunk，也就是同一条计算流上更早的 kernel，kernel 边界天然保证 o3 可见；本 chunk 自己的行由 CTA 对 `ready` 的 `ld.acquire` 保证
+* `zip_done` 的发布用 `__syncthreads()` + 0 号线程一次 `__threadfence_system()` 再批量 `st.release.sys`：一个 token 的 hidden 是 32 个 lane 分着写的，只靠 lane 0 的 release 管不住别人的 store，而每 token 每 lane 都 fence 太贵，按 CTA 摊一次即可
+* `test_zip.py` 三组 `(num_sms, chunk)` 配置全部与 `moe_unpermute` 逐位一致（`diff: 0`），`token_done` 恰好等于 `num_valid_topk`，`zip_done` 全 1
+* TODO：性能测量（这台是共享机，测不准，等独占机器）；接进 `test_chunk.py` 的全链路，届时要注意 `combine_input`/`zip_done`/`token_done` 每轮都要重置
 
 

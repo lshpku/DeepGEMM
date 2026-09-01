@@ -6,6 +6,7 @@
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
 #include "../jit_kernels/impls/smxx_chunk_token_done.hpp"
 #include "../jit_kernels/impls/smxx_chunk_weighted_swiglu.hpp"
+#include "../jit_kernels/impls/smxx_chunk_zip.hpp"
 #endif
 
 namespace deep_gemm::overlap {
@@ -133,6 +134,61 @@ static void chunk_signal_token_done(const torch::Tensor& atomic_to_zip,
                           zip_task_queue, zip_queue_tail, task_queue, task_idx);
 }
 
+// Publish the token completion of one chunk and zip whatever it finishes, replacing the
+// `chunk_signal_token_done` + standalone zip pair with one kernel on the compute stream
+// NOTES: `combine_input` and `zip_done` are updated in place, the former holding the sum of
+//        `o3` over a token's local experts in the DeepEP order, the latter flagging the rows
+//        that `combine` may send; both are indexed by the unduplicated token
+// NOTES: the experts are summed in ascending order of the expert index, which `recv_token_indices`
+//        provides, so that the result does not depend on the chunk arrival order
+static void chunk_zip(const torch::Tensor& o3, const torch::Tensor& combine_input,
+                      const torch::Tensor& atomic_to_zip, const torch::Tensor& zip_to_atomic,
+                      const torch::Tensor& recv_token_indices,
+                      const torch::Tensor& num_valid_topk,
+                      const torch::Tensor& token_done, const torch::Tensor& zip_done,
+                      const torch::Tensor& task_queue,
+                      const int& task_idx, const int& chunk_size) {
+    // Type and shape checks
+    const auto [num_unzipped_tokens, hidden_size] = get_shape<2>(o3);
+    const auto [num_recv_tokens, hidden_size_] = get_shape<2>(combine_input);
+    DG_HOST_ASSERT(hidden_size == hidden_size_);
+    DG_HOST_ASSERT(o3.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(combine_input.scalar_type() == torch::kBFloat16);
+    check_major_type_cd(o3);
+    check_major_type_cd(combine_input);
+
+    // The row-indexed table follows `o3`, and the token-indexed ones follow `combine_input`
+    DG_HOST_ASSERT(atomic_to_zip.is_contiguous() and atomic_to_zip.dim() == 1);
+    DG_HOST_ASSERT(atomic_to_zip.numel() == num_unzipped_tokens);
+    DG_HOST_ASSERT(atomic_to_zip.scalar_type() == torch::kInt);
+    for (const auto& table: {num_valid_topk, token_done, zip_done}) {
+        DG_HOST_ASSERT(table.is_contiguous() and table.dim() == 1);
+        DG_HOST_ASSERT(table.numel() == num_recv_tokens);
+        DG_HOST_ASSERT(table.scalar_type() == torch::kInt);
+    }
+
+    // The two top-k tables share their layout, and `recv_token_indices` is the only one
+    // that carries the expert indices, hence the ordering of the sum
+    const auto [num_recv_tokens_, num_topk] = get_shape<2>(zip_to_atomic);
+    const auto [num_recv_tokens__, num_topk_] = get_shape<2>(recv_token_indices);
+    DG_HOST_ASSERT(num_recv_tokens_ == num_recv_tokens and num_recv_tokens__ == num_recv_tokens);
+    DG_HOST_ASSERT(num_topk_ == num_topk and num_topk <= 32);
+    DG_HOST_ASSERT(zip_to_atomic.is_contiguous() and zip_to_atomic.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(recv_token_indices.is_contiguous() and recv_token_indices.scalar_type() == torch::kLong);
+
+    // The task queue is `[num_tasks, kNumChunkTaskFields]` on the device
+    DG_HOST_ASSERT(task_queue.is_contiguous());
+    DG_HOST_ASSERT(task_queue.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(task_queue.dim() == 2 and task_queue.size(1) == kNumChunkTaskFields);
+    DG_HOST_ASSERT(0 <= task_idx and task_idx < task_queue.size(0));
+
+    // The chunk size only sizes the CTA-local queue, so any upper bound works
+    DG_HOST_ASSERT(chunk_size > 0);
+
+    smxx_chunk_zip(o3, combine_input, atomic_to_zip, zip_to_atomic, recv_token_indices,
+                   num_valid_topk, token_done, zip_done, task_queue, task_idx, chunk_size);
+}
+
 #endif
 
 static void register_apis(pybind11::module_& m) {
@@ -150,6 +206,12 @@ static void register_apis(pybind11::module_& m) {
           py::arg("atomic_to_zip"), py::arg("num_valid_topk"), py::arg("token_done"),
           py::arg("zip_task_queue"), py::arg("zip_queue_tail"),
           py::arg("task_queue"), py::arg("task_idx"));
+    m.def("chunk_zip", &chunk_zip,
+          py::arg("o3"), py::arg("combine_input"),
+          py::arg("atomic_to_zip"), py::arg("zip_to_atomic"),
+          py::arg("recv_token_indices"), py::arg("num_valid_topk"),
+          py::arg("token_done"), py::arg("zip_done"),
+          py::arg("task_queue"), py::arg("task_idx"), py::arg("chunk_size"));
     m.attr("num_chunk_task_fields") = static_cast<int>(kNumChunkTaskFields);
 #endif
 }

@@ -39,6 +39,8 @@
 
 <b>关于chunk的说明：</b>其实通信并不是严格按chunk发送的，它相当于是细水长流地并发收到各个专家的token，然后push到各个专家的buffer上，我所谓的“概念上”指的是当一个专家每凑够chunk数量的token时，就理解为它的一个chunk到达了，并不是说一个chunk突然就一次性到达了。使用chunk这个概念是为了保证GEMM的连续性，因为我们是训练场景，如果每到一个token就计算，性能肯定非常差。
 
+<b>关于zip：</b>目前计算这边自己也实现了一个 zip，融合到 signal_done 里了，每个 chunk 调用一次；用于替代通信的 persistent zip，理论上可以给计算换更多的 SM；不过目前实测性能上相差无几，最终用哪个还没决定。
+
 
 ## 计算部分设计细节
 
@@ -97,8 +99,12 @@ dispatch 给到计算的除了 unzipped_tokens 和 unzipped_probs，还有一个
 * m_size 是 chunk 包含的 token 数，一般为 chunk 大小，但对于一个专家的余数部分是可以小于 chunk 大小的，计算这边用了动态 M 的 kernel
 * 该队列是一个 FIFO 队列，ready 的任务会按顺序连续 push 进来，计算这边也使用递增方式按顺序等待 ready 信号即可
 
-dispatch 给了一张映射表用于前向 atomic 序向 DeepEP 序的转换，该表随着 receiver 更新，收到 token 后才赋值，当然我们读到 ready 时说明这个 chunk 内所有 token 的信息都就绪了：
+dispatch 的一个输出可以用于专家下标排序：
+`recv_token_indices`[num_recv_tokens, topk] int64 : 使用 DeepEP 序，收到的 token 属于本地哪些专家（最少1个，最多topk个，使用本地专家下标，无效部分用-1填充，行内未排序）
+
+dispatch 给了两张映射表用于前向 atomic 序和 DeepEP 序之间的转换，该表随着 receiver 更新，收到 token 后才赋值；当然通信算子保证我们读到 ready 时这个 chunk 内所有 token 的信息都就绪了：
 `atomic_to_zip`[num_unzipped_tokens] int32 : 使用 atomic 序，记录一个 token 指向 DeepEP 序里的哪个下标，padding 位置填 -1
+`zip_to_atomic`[num_recv_tokens, topk] int32 : 使用 DeepEP 序，位置和 recv_token_indices 一一对应，记录对于每个有效的 token，zip 的时候应该去 o3 的哪个下标读，无效位置填 -1
 
 为了让 zip 算子知道每个 token 的有效 topk 数，dispatch 还会给一张计数表，同样是随 ready 动态更新的：
 `num_valid_topk`[num_recv_tokens] int32 : 使用 DeepEP 序，记录每个 token 在本地有几个专家，其值等价于**通信完成后** recv_token_indices 里面每行非 -1 的数量，但是在运行时不相等，因为 recv_token_indices 的一行是分专家更新的，一个 chunk 就绪时只保证这个 chunk 所属专家在 recv_token_indices 里面的槽位就绪，不保证这一行所有专家都就绪，导致数少了；num_valid_topk 则是通过冗余更新解决这个问题，一个 token 的每个专家的 chunk 发布时都会重新写一次 topk 值
@@ -106,3 +112,6 @@ dispatch 给了一张映射表用于前向 atomic 序向 DeepEP 序的转换，�
 done 算子需要维护以下两张表用于记录 token 完成情况：
 `token_done`[num_recv_tokens] int32 : 使用 DeepEP 序，当一个 token 的计数等于 num_valid_topk 里的对应值时，说明它被所有专家计算完了，就可以进行 zip 了；这张表只在计算内部用，不需要给通信
 `zip_task_queue`[num_recv_tokens] int32 : 是一个连续填充的队列，内容为计算完的 token 在 DeepEP 序中的下标，完成的 token 会被依次 push 进来；该队列初始值为 -1，这样当读到非 -1 的值时就知道就绪了，不需要额外 ready 信号；该队列会给到通信
+
+zip 和 combine 之间通过一个表记录每个 token 是否可以被 combine：
+`zip_done`[num_recv_tokens] int32 : 使用 DeepEP 序，仅使用 0/1 值表示，由 zip 向已经完成 zip 的 token 位置写 1

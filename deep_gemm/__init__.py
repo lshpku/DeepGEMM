@@ -62,6 +62,7 @@ try:
         bf16_chunk_gemm_nn,
         chunk_weighted_swiglu,
         chunk_signal_token_done,
+        chunk_zip,
         num_chunk_task_fields,
         # Einsum kernels
         einsum,
