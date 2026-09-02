@@ -50,15 +50,25 @@ sm100_store_cd_swap_ab(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint3
         tma_stage_idx = (tma_stage_idx + 1) % kNumTMAStoreStages;
     };
 
-    // Fused SwiGLU: one 16B group per thread covers the whole `[STORE_BLOCK_M, 64]` output tile,
-    // and the indices do not depend on the store stage
+    // Fused SwiGLU: the gate/up pair of one channel is adjacent in the fully interleaved
+    // layout, so a 16B group holds `kNumFusedElems / 2` finished channels; one thread takes
+    // two adjacent groups to keep the output store 16B wide, which makes the whole
+    // `[STORE_BLOCK_M, STORE_BLOCK_N]` staged tile the `[STORE_BLOCK_M, 64]` output tile
+    // NOTES: the indices do not depend on the store stage
     constexpr uint32_t kNumFusedElems = kNumBankGroupBytes / sizeof(cutlass::bfloat16_t);
-    constexpr uint32_t kNumFusedColGroups = STORE_BLOCK_N_ATOM / kNumFusedElems;
+    constexpr uint32_t kNumAtomColGroups = STORE_BLOCK_N_ATOM / kNumFusedElems;
+    constexpr uint32_t kNumFusedColPairs = STORE_BLOCK_N / (kNumFusedElems * 2);
     const auto fused_thread_idx = epilogue_warp_idx * 32 + lane_idx;
-    const auto fused_token = fused_thread_idx / kNumFusedColGroups;
-    const auto fused_col_group = fused_thread_idx % kNumFusedColGroups;
-    const auto fused_smem_off = fused_token * kSwizzleCDMode +
-                                (fused_col_group ^ (fused_token % 8)) * kNumBankGroupBytes;
+    const auto fused_token = fused_thread_idx / kNumFusedColPairs;
+    const auto fused_col_pair = fused_thread_idx % kNumFusedColPairs;
+    // A pair never straddles two swizzle atoms, as an atom holds an even number of groups
+    const auto fused_col_group = fused_col_pair * 2;
+    const auto fused_atom_off = (fused_col_group / kNumAtomColGroups) * (STORE_BLOCK_M * kSwizzleCDMode);
+    const auto fused_atom_group = fused_col_group % kNumAtomColGroups;
+    const auto fused_smem_off = fused_atom_off + fused_token * kSwizzleCDMode +
+                                (fused_atom_group ^ (fused_token % 8)) * kNumBankGroupBytes;
+    const auto fused_smem_off_hi = fused_atom_off + fused_token * kSwizzleCDMode +
+                                   ((fused_atom_group + 1) ^ (fused_token % 8)) * kNumBankGroupBytes;
 
     // Iterate over M blocks
     const auto num_stores = effective_m / STORE_BLOCK_M;
@@ -158,33 +168,36 @@ sm100_store_cd_swap_ab(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint3
         }
         __syncwarp();
 
-        // Fused SwiGLU: with the interleaved weights, this block's 64 gate channels sit in the
-        // first swizzle atom of the staged tile and the matching 64 up channels in the second,
-        // so the activation can be finished here instead of by a second pass over `o1`
+        // Fused SwiGLU: with the fully interleaved weights, a channel's gate and up columns are
+        // neighbours in the staged tile, so the activation can be finished here instead of by a
+        // second pass over `o1`
         // NOTES: reading the tile is safe until the next iteration's named barrier, which is
         //        what gates the next STSM into it
         if constexpr (kWithFusedSwiGLU) {
             DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Fused SwiGLU requires BF16 C/D");
             DG_STATIC_ASSERT(STORE_BLOCK_N == 128, "Fused SwiGLU requires a 2-atom store block");
-            DG_STATIC_ASSERT(STORE_BLOCK_M * kNumFusedColGroups == kNumUMMAStoreThreads, "Invalid fused tile");
+            DG_STATIC_ASSERT(kNumAtomColGroups % 2 == 0, "A column pair must stay inside one atom");
+            DG_STATIC_ASSERT(STORE_BLOCK_M * kNumFusedColPairs == kNumUMMAStoreThreads, "Invalid fused tile");
 
-            const auto* gate_ptr = reinterpret_cast<const uint8_t*>(smem_cd[tma_stage_idx]) + fused_smem_off;
-            const auto gate_vec = *reinterpret_cast<const int4*>(gate_ptr);
-            const auto up_vec = *reinterpret_cast<const int4*>(gate_ptr + STORE_BLOCK_M * kSwizzleCDMode);
+            const auto* tile_ptr = reinterpret_cast<const uint8_t*>(smem_cd[tma_stage_idx]);
+            const auto lo_vec = *reinterpret_cast<const int4*>(tile_ptr + fused_smem_off);
+            const auto hi_vec = *reinterpret_cast<const int4*>(tile_ptr + fused_smem_off_hi);
 
-            const auto* gate = reinterpret_cast<const cutlass::bfloat16_t*>(&gate_vec);
-            const auto* up = reinterpret_cast<const cutlass::bfloat16_t*>(&up_vec);
+            const auto* lo = reinterpret_cast<const cutlass::bfloat16_t*>(&lo_vec);
+            const auto* hi = reinterpret_cast<const cutlass::bfloat16_t*>(&hi_vec);
             cutlass::bfloat16_t out[kNumFusedElems];
             #pragma unroll
             for (uint32_t i = 0; i < kNumFusedElems; ++ i) {
-                const auto g = static_cast<float>(gate[i]);
+                const auto* pair = i < kNumFusedElems / 2 ? lo : hi;
+                const auto j = (i % (kNumFusedElems / 2)) * 2;
+                const auto g = static_cast<float>(pair[j]);
                 out[i] = static_cast<cutlass::bfloat16_t>(
-                    __fdividef(g, 1.0f + __expf(-g)) * static_cast<float>(up[i]) * fused_prob);
+                    __fdividef(g, 1.0f + __expf(-g)) * static_cast<float>(pair[j + 1]) * fused_prob);
             }
 
-            // The interleaved N index maps to half of it in the activation
+            // Two interleaved columns make one activation channel
             auto* out_ptr = fused_o2 + static_cast<uint64_t>(base_m_idx + s * STORE_BLOCK_M + fused_token) * fused_ld_o2 +
-                            base_n_idx / 2 + fused_col_group * kNumFusedElems;
+                            base_n_idx / 2 + fused_col_pair * kNumFusedElems;
             *reinterpret_cast<int4*>(out_ptr) = *reinterpret_cast<const int4*>(out);
         }
     }

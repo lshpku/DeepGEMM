@@ -60,7 +60,9 @@ static void smxx_chunk_weighted_swiglu(const torch::Tensor& o1,
                                        const bool& precise) {
     constexpr int kNumThreads = 1024;
     constexpr int kNumElemsPerAccess = 8;
-    constexpr int kNumVecsPerThread = 2;
+    // NOTES: one vector already issues two loads with the interleaved layout, so a single
+    //        vector per thread keeps enough in flight; sweeping 2/4/8 only made it slower
+    constexpr int kNumVecsPerThread = 1;
 
     const auto num_sms = device_runtime->get_num_sms();
     const auto shape_n = static_cast<int>(o2.size(-1));

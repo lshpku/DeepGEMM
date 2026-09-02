@@ -10,7 +10,7 @@
 namespace deep_gemm {
 
 // Weighted SwiGLU over one chunk of one expert, claimed from the chunk task queue
-// NOTES: the gate/up halves are concatenated along N, i.e. `o2 = silu(o1[:, :N]) * o1[:, N:] * prob`
+// NOTES: the gate/up columns are fully interleaved, i.e. `o2[:, j] = silu(o1[:, 2j]) * o1[:, 2j+1] * prob`
 //        the chunk's padded tail is zeroed, or the down GEMM would consume garbage rows
 template <uint32_t kNumSMs, uint32_t kNumThreads, uint32_t kNumElemsPerAccess,
           uint32_t kNumVecsPerRow, uint32_t kNumVecsPerThread, bool kPrecise>
@@ -36,9 +36,11 @@ smxx_chunk_weighted_swiglu_impl(const int* task_queue, uint32_t task_idx,
     const auto m_start = static_cast<uint32_t>(task.m_start);
     const auto m_size = static_cast<uint32_t>(task.m_size);
 
-    // Vectorized element-wise traversal over `[align(m_size, m_alignment), kShapeN]`
-    // NOTES: one thread owns `kNumVecsPerThread` vectors a whole grid stride apart, so every
-    //        load stays perfectly coalesced while several of them are in flight at once
+    // Vectorized element-wise traversal over `o2`'s `[align(m_size, m_alignment), kShapeN]`
+    // NOTES: one output vector consumes two adjacent input vectors, as a gate/up pair is
+    //        adjacent in the fully interleaved layout; a lane's two loads are 32B apart so each
+    //        one alone uses half of every sector it fetches, but together they cover exactly
+    //        the contiguous range the warp needs and the second one hits L1
     // NOTES: the row length is a template parameter, so the row/column split of a flat index
     //        is a shift instead of a division for the usual power-of-two `N`
     using vec_t = int4;
@@ -51,7 +53,7 @@ smxx_chunk_weighted_swiglu_impl(const int* task_queue, uint32_t task_idx,
     // Persistent: a fixed number of CTAs strides over all the work
     for (uint32_t base = blockIdx.x * kNumThreads + threadIdx.x; base < num_vecs;
          base += kGridStride * kNumVecsPerThread) {
-        vec_t gate_vec[kNumVecsPerThread], up_vec[kNumVecsPerThread];
+        vec_t lo_vec[kNumVecsPerThread], hi_vec[kNumVecsPerThread];
         float prob[kNumVecsPerThread];
         uint32_t row[kNumVecsPerThread], col[kNumVecsPerThread];
         bool in_range[kNumVecsPerThread], is_real[kNumVecsPerThread];
@@ -67,9 +69,9 @@ smxx_chunk_weighted_swiglu_impl(const int* task_queue, uint32_t task_idx,
             col[j] = (idx % kNumVecsPerRow) * kNumElemsPerAccess;
 
             if (is_real[j]) {
-                const auto* gate_ptr = o1 + static_cast<uint64_t>(row[j]) * kShapeN * 2 + col[j];
-                gate_vec[j] = __ldg(reinterpret_cast<const vec_t*>(gate_ptr));
-                up_vec[j] = __ldg(reinterpret_cast<const vec_t*>(gate_ptr + kShapeN));
+                const auto* gate_up_ptr = o1 + static_cast<uint64_t>(row[j]) * kShapeN * 2 + col[j] * 2;
+                lo_vec[j] = __ldg(reinterpret_cast<const vec_t*>(gate_up_ptr));
+                hi_vec[j] = __ldg(reinterpret_cast<const vec_t*>(gate_up_ptr + kNumElemsPerAccess));
                 prob[j] = probs[row[j]];
             }
         }
@@ -83,12 +85,14 @@ smxx_chunk_weighted_swiglu_impl(const int* task_queue, uint32_t task_idx,
 
             cutlass::bfloat16_t out[kNumElemsPerAccess] = {};
             if (is_real[j]) {
-                const auto* gate = reinterpret_cast<const cutlass::bfloat16_t*>(&gate_vec[j]);
-                const auto* up = reinterpret_cast<const cutlass::bfloat16_t*>(&up_vec[j]);
+                const auto* lo = reinterpret_cast<const cutlass::bfloat16_t*>(&lo_vec[j]);
+                const auto* hi = reinterpret_cast<const cutlass::bfloat16_t*>(&hi_vec[j]);
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumElemsPerAccess; ++ i) {
-                    const auto g = static_cast<float>(gate[i]);
-                    const auto u = static_cast<float>(up[i]);
+                    const auto* pair = i < kNumElemsPerAccess / 2 ? lo : hi;
+                    const auto k = (i % (kNumElemsPerAccess / 2)) * 2;
+                    const auto g = static_cast<float>(pair[k]);
+                    const auto u = static_cast<float>(pair[k + 1]);
                     const auto silu = kPrecise ? g * (1.0f / (1.0f + expf(-g)))
                                                : __fdividef(g, 1.0f + __expf(-g));
                     out[i] = static_cast<cutlass::bfloat16_t>(silu * u * prob[j]);

@@ -31,7 +31,6 @@ TOPK = 8
 CHUNK = 4096
 NUM_SMS = 96
 ALIGNMENT = 128
-GROUP = 64          # the gate/up interleave granularity required by the fused epilogue
 FUSE_SWIGLU = True  # fuse the SwiGLU into the gate-up epilogue instead of a second kernel
 
 
@@ -48,10 +47,8 @@ def parse_args():
 
 
 def calc_diff(x, y):
-    x, y = x.astype("float32"), y.astype("float32")
-    denominator = (x * x + y * y).sum()
-    sim = 2 * (x * y).sum() / denominator
-    return (1 - sim).item()
+    diff = (x.float() - y.float()).abs()
+    return float(diff.mean()), float(diff.max())
 
 
 def make_routed_layout():
@@ -138,21 +135,17 @@ def make_task_queue(counts, m_start, ready, seed=0):
 
 
 def interleave_gateup(w_gateup):
-    """`[gate | up]` -> `[gate[0:64], up[0:64], ...]` per expert, what the fused epilogue needs."""
-    perm = []
-    for start in range(0, I, GROUP):
-        perm.extend(range(start, start + GROUP))
-        perm.extend(range(I + start, I + start + GROUP))
-    perm = paddle.to_tensor(np.asarray(perm, dtype=np.int32))
-    return w_gateup.index_select(perm, axis=2).contiguous()
+    """`[gate | up]` -> `[gate[0], up[0], gate[1], up[1], ...]` per expert, the Paddle layout."""
+    perm = np.empty([2 * I], dtype=np.int32)
+    perm[0::2] = np.arange(I)
+    perm[1::2] = np.arange(I) + I
+    return w_gateup.index_select(paddle.to_tensor(perm), axis=2).contiguous()
 
 
 def split_gate_up(o1):
-    """The gate/up halves of `o1`, whatever column order the weight was in."""
-    if FUSE_SWIGLU:
-        blocks = o1.reshape([o1.shape[0], I // GROUP, 2, GROUP])
-        return blocks[:, :, 0].reshape([-1, I]), blocks[:, :, 1].reshape([-1, I])
-    return o1[:, :I], o1[:, I:]
+    """The gate/up halves of `o1`, which is in the fully interleaved column order."""
+    blocks = o1.reshape([o1.shape[0], I, 2])
+    return blocks[:, :, 0], blocks[:, :, 1]
 
 
 def reference(x, w_gateup, w_down, probs, m_indices, perf=None):
@@ -187,7 +180,7 @@ def reference(x, w_gateup, w_down, probs, m_indices, perf=None):
     else:
         gate, up = split_gate_up(o1)
         gate, up = gate.float(), up.float()
-        o2 = (F.silu(gate) * up * probs.unsqueeze(-1)).astype("bfloat16")
+        o2 = ((gate * F.sigmoid(gate)) * up * probs.unsqueeze(-1)).astype("bfloat16")
 
     o3 = paddle.empty([x.shape[0], H], dtype="bfloat16")
     deep_gemm.m_grouped_bf16_gemm_nn_contiguous(o2, w_down, o3, m_indices)
@@ -212,7 +205,7 @@ def compute_chunk(task_idx, buffers, task_queue):
         deep_gemm.bf16_chunk_gemm_nn(x, w_gateup, o1, task_queue, task_idx, o2=o2, probs=probs)
     else:
         deep_gemm.bf16_chunk_gemm_nn(x, w_gateup, o1, task_queue, task_idx)
-        deep_gemm.chunk_weighted_swiglu(o1, probs, o2, task_queue, task_idx)
+        deep_gemm.chunk_weighted_swiglu(o1, probs, o2, task_queue, task_idx, precise=True)
     deep_gemm.bf16_chunk_gemm_nn(o2, w_down, o3, task_queue, task_idx)
     deep_gemm.chunk_signal_token_done(atomic_to_zip, num_valid_topk, token_done,
                                       zip_task_queue, zip_queue_tail, task_queue, task_idx)
@@ -237,7 +230,7 @@ def main():
     m_total = len(atomic_to_zip)
     num_valid_topk = paddle.sum(topk_indices >= 0, axis=1).astype("int32")
     print("arrival:", args.arrival, "| interval:", args.interval_ms,
-          "ms | check_signal:", args.check_signal)
+          "ms | check_signal:", args.check_signal, "| fuse_swiglu:", FUSE_SWIGLU)
     print("num_recv_tokens:", num_recv_tokens)
     print("tokens_per_expert:", tokens_per_expert)
     print("num_unzipped_tokens:", m_total, "seq_len:", SEQLEN, "topk:", TOPK)
@@ -247,8 +240,7 @@ def main():
     w_down = paddle.randn([E, I, H], "bfloat16") * 0.02
     probs = paddle.rand([m_total], "float32")
 
-    if FUSE_SWIGLU:
-        w_gateup = interleave_gateup(w_gateup)
+    w_gateup = interleave_gateup(w_gateup)
 
     deep_gemm.set_num_sms(NUM_SMS)
     o1_ref, o2_ref, o3_ref = reference(x, w_gateup, w_down, probs, m_indices)
@@ -363,12 +355,12 @@ def main():
 
     ################################# VALIDATE #################################
     # Only the real rows are compared: the padded rows are computed by the reference but
-    # zeroed (o2) or left as the down GEMM's garbage (o3) by the chunk path
-    valid_rows = atomic_to_zip.nonzero()
+    # zeroed (o2, standalone SwiGLU only) or left as the down GEMM's garbage (o3) by the chunk path
+    valid_rows = (atomic_to_zip >= 0).nonzero()
     for name, out, ref, tol in (("o1", o1, o1_ref, 0.0), ("o2", o2, o2_ref, 1e-6), ("o3", o3, o3_ref, 1e-6)):
-        diff = calc_diff(out.index_select(valid_rows), ref.index_select(valid_rows))
-        print(f"{name}: diff={diff:.3e}")
-        assert diff <= tol, f"{name} mismatch: {diff}"
+        avg, mean = calc_diff(out.index_select(valid_rows), ref.index_select(valid_rows))
+        print(f"{name}: avg: {avg} mean: {mean}")
+        assert avg <= tol, f"{name} mismatch"
 
     # Every token must have been counted by exactly its own number of experts
     final = token_done.numpy()

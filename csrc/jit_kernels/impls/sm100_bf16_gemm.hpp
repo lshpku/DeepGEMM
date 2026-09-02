@@ -216,7 +216,7 @@ static void sm100_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
 // NOTES: `A`/`D` use the whole contiguous (128-aligned) unzipped layout, and the task
 //        descriptor tells the kernel which row range and which expert to use
 // NOTES: with `o2`/`probs` given, the weighted SwiGLU is fused into the epilogue, which
-//        requires `b` to be interleaved in 64-column groups
+//        requires `b`'s gate/up columns to be fully interleaved
 static void sm100_bf16_chunk_gemm(const torch::Tensor& a,
                                   const torch::Tensor& b,
                                   const torch::Tensor& d,

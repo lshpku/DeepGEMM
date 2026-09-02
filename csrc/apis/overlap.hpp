@@ -17,8 +17,8 @@ namespace deep_gemm::overlap {
 // Shape must be `[M, K] @ [G, K, N]`, where the task queue holds
 // `[expert_idx, m_start, m_size, ready]` per task, and one call computes one task
 // NOTES: passing `o2` and `probs` fuses the weighted SwiGLU into the epilogue, which needs
-//        `b`'s columns interleaved in groups of 64, i.e. `[gate[0:64], up[0:64], gate[64:128], ...]`,
-//        so that one `BLOCK_N` tile holds both halves of the same 64 activation channels;
+//        `b`'s columns fully interleaved, i.e. `[gate[0], up[0], gate[1], up[1], ...]`
+//        (the Paddle MoE convention), so that a channel's gate and up land side by side;
 //        `d` then keeps the linear output (in that interleaved order) for the backward pass
 static void bf16_chunk_gemm_nn(const torch::Tensor& a, const torch::Tensor& b,
                                const torch::Tensor& d,
@@ -70,7 +70,7 @@ static void bf16_chunk_gemm_nn(const torch::Tensor& a, const torch::Tensor& b,
                           num_groups, m, n, k, major_a, major_b, compiled_dims, o2, probs);
 }
 
-// Weighted SwiGLU for one chunk task: `o2 = silu(o1[:, :N]) * o1[:, N:] * probs`
+// Weighted SwiGLU for one chunk task: `o2[:, j] = silu(o1[:, 2j]) * o1[:, 2j + 1] * probs`
 static void chunk_weighted_swiglu(const torch::Tensor& o1, const torch::Tensor& probs,
                                   const torch::Tensor& o2,
                                   const torch::Tensor& task_queue,

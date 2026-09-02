@@ -120,3 +120,17 @@ python tests_overlap/test_zip.py
 * TODO：性能测量（这台是共享机，测不准，等独占机器）；接进 `test_chunk.py` 的全链路，届时要注意 `combine_input`/`zip_done`/`token_done` 每轮都要重置
 
 
+9.2: 把 w_gateup 的交错粒度从 64 列改成完全交错（一列 gate 一列 up），和 paddle 生态对齐
+* 权重列变成 `[gate[0], up[0], gate[1], up[1], ...]`，融合路径和独立 swiglu kernel 两条路都按这个布局，上层不再需要两种权重
+* 融合 epilogue：一个通道的 gate/up 现在是相邻两列，落在**同一个 16B bank group** 里；一个 16B 组只能出 4 个通道（8B 输出），为了保持 16B 的输出 store，改成一个线程吃相邻两个组（两次 smem load，一次 16B store）
+* 相邻两组不会跨 swizzle atom（一个 atom 有 8 组），所以 XOR swizzle 按组各算一次偏移即可；线程划分从 `[STORE_BLOCK_M, 8 组]` 变成 `[STORE_BLOCK_M, 8 对]`，仍然恰好 128 线程，但覆盖的是整个 `[16, 128]` staged tile 而不是半个
+* 独立 swiglu kernel：仍按 o2 的 16B 输出向量遍历，只是一个输出向量要读 o1 相邻的两个 16B 向量。单条指令上 warp 的 32 个 lane 地址间隔 32B（只用到一半 sector），但两条 load 合起来正好覆盖 warp 需要的连续区间，第二条命中 L1
+* 独立 swiglu 的 `kNumVecsPerThread` 从 2 改成 1：现在一个向量本身就发两条 load，in-flight 已经够了，实测 unroll 1/2/4/8 = 10.8/11.9/12.9/23.2us。改完 10.8us / 4.68 TB/s，和交错之前的最优值持平，即完全交错在这个 kernel 上是免费的
+* 也试过"按输入遍历、一条完全合并的 load 配一个 8B store"的版本（曾作为 `kCoalesced` 分支存在，已删）：unroll 1/2/4/8 全在 3.4~3.9 TB/s，明显更差，8B store 的代价大于 load 只用半个 sector 的代价
+* 关于"能不能到带宽上限"：这台 B30Z 整卡 d2d copy 上限约 6.33 TB/s，同一个 swiglu 放开到 148 SM 能跑到 5.48 TB/s，而 96 SM 下 4.68 TB/s 已经高于按 SM 数线性折算的 4.11 TB/s，所以 96 SM 这个预算下基本到顶了，不是并行度写得不够
+* 融合开销仍在噪声内（gemm only 118.5us vs 融合 116.9us），o1/o2/o3 与 group_gemm 参考逐位一致
+* 测试侧：`interleave_gateup` / `interleave_columns` 换成完全交错，`split_gate_up` 按 `[m, I, 2]` 拆；`test_chunk.py` 新增 `--no-fuse` 跑独立 swiglu 那条路
+* 顺手修了个测试 bug：`valid_rows = atomic_to_zip.nonzero()` 把 padding 行（值 -1）也当成有效行，同时漏掉了 token 0 那行；改成 `(atomic_to_zip >= 0).nonzero()`。之前只跑融合路径所以没暴露——融合 epilogue 对 padding 行照算，和 reference 一致；独立 swiglu 会把 padding 尾巴补零，于是 o2/o3 的 padding 行对不上（diff 4e-3，正好是 1124/136448 行的能量占比）
+* 坑：JIT 的 cache key 只哈希生成的那段 wrapper 代码（`name$$compiler$$flags$$code`），不包含 `.cuh` 的内容，改 header 后如果模板参数不变就会命中旧 cubin；调这类改动记得 `rm -rf ~/.deep_gemm/cache`
+
+

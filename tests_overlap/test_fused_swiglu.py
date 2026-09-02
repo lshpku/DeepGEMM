@@ -19,7 +19,6 @@ import deep_gemm
 
 H = 4096
 I = 2048
-GROUP = 64  # the interleave granularity, i.e. half of the epilogue's store block N
 
 
 def parse_args():
@@ -38,13 +37,12 @@ def calc_diff(x, y):
 
 
 def interleave_columns(num_cols):
-    """`[gate | up]` -> `[gate[0:64], up[0:64], gate[64:128], up[64:128], ...]`, a free relayout."""
+    """`[gate | up]` -> `[gate[0], up[0], gate[1], up[1], ...]`, a free relayout."""
     half = num_cols // 2
-    perm = []
-    for start in range(0, half, GROUP):
-        perm.extend(range(start, start + GROUP))
-        perm.extend(range(half + start, half + start + GROUP))
-    return np.asarray(perm, dtype=np.int64)
+    perm = np.empty([num_cols], dtype=np.int64)
+    perm[0::2] = np.arange(half)
+    perm[1::2] = np.arange(half) + half
+    return perm
 
 
 def bench(fn, name, iters):
@@ -83,9 +81,9 @@ def main():
     # Reference: a plain GEMM on the interleaved weight, then SwiGLU on the de-interleaved halves
     o1_ref = paddle.empty([m, 2 * I], "bfloat16")
     deep_gemm.bf16_gemm_nn(x, w_inter, o1_ref)
-    blocks = o1_ref.reshape([m, 2 * I // (2 * GROUP), 2, GROUP])
-    gate = blocks[:, :, 0].reshape([m, I]).astype("float32")
-    up = blocks[:, :, 1].reshape([m, I]).astype("float32")
+    blocks = o1_ref.reshape([m, I, 2])
+    gate = blocks[:, :, 0].astype("float32")
+    up = blocks[:, :, 1].astype("float32")
     o2_ref = (F.silu(gate) * up * probs.unsqueeze(-1)).astype("bfloat16")
 
     # The fused kernel: `o1` in the interleaved order, `o2` straight out of the epilogue
