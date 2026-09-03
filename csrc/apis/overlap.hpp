@@ -14,28 +14,26 @@ namespace deep_gemm::overlap {
 #if DG_TENSORMAP_COMPATIBLE
 
 // Chunk-wise BF16 GEMM for the fine-grained compute-communication overlap
-// Shape must be `[M, K] @ [G, K, N]`, where the task queue holds
+// Shape must be `[M, K] @ [G, N, K].mT`, where the task queue holds
 // `[expert_idx, m_start, m_size, ready]` per task, and one call computes one task
 // NOTES: passing `o2` and `probs` fuses the weighted SwiGLU into the epilogue, which needs
-//        `b`'s columns fully interleaved, i.e. `[gate[0], up[0], gate[1], up[1], ...]`
+//        `b`'s gate/up rows fully interleaved, i.e. `[gate[0], up[0], gate[1], up[1], ...]`
 //        (the Paddle MoE convention), so that a channel's gate and up land side by side;
 //        `d` then keeps the linear output (in that interleaved order) for the backward pass
-static void bf16_chunk_gemm_nn(const torch::Tensor& a, const torch::Tensor& b,
+static void bf16_chunk_gemm_nt(const torch::Tensor& a, const torch::Tensor& b,
                                const torch::Tensor& d,
                                const torch::Tensor& task_queue,
                                const int& task_idx,
                                const std::optional<torch::Tensor>& o2,
                                const std::optional<torch::Tensor>& probs,
                                const std::string& compiled_dims) {
-    // Transpose into `[G, N, K].mT`
-    const auto& b_t = b.transpose(1, 2);
     const auto major_a = get_major_type_ab(a);
-    const auto major_b = get_major_type_ab(b_t);
+    const auto major_b = get_major_type_ab(b);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
 
     // Type and shape checks
     const auto [m, k] = get_shape<2>(a);
-    const auto [num_groups, n, k_] = get_shape<3>(b_t);
+    const auto [num_groups, n, k_] = get_shape<3>(b);
     const auto [m_, n_] = get_shape<2>(d);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
     DG_HOST_ASSERT(m > 0 and n > 0 and k > 0 and num_groups > 0);
@@ -66,8 +64,20 @@ static void bf16_chunk_gemm_nn(const torch::Tensor& a, const torch::Tensor& b,
     // Dispatch implementation
     const auto arch_major = device_runtime->get_arch_major();
     DG_HOST_ASSERT(arch_major == 10 and "Chunk GEMM only supports SM100 for now");
-    sm100_bf16_chunk_gemm(a, b_t, d, task_queue, task_idx,
+    sm100_bf16_chunk_gemm(a, b, d, task_queue, task_idx,
                           num_groups, m, n, k, major_a, major_b, compiled_dims, o2, probs);
+}
+
+// The same GEMM with a `[G, K, N]` weight, which the forward stores and passes along
+// NOTES: the only difference is `B`'s major type, so both variants share one kernel template
+static void bf16_chunk_gemm_nn(const torch::Tensor& a, const torch::Tensor& b,
+                               const torch::Tensor& d,
+                               const torch::Tensor& task_queue,
+                               const int& task_idx,
+                               const std::optional<torch::Tensor>& o2,
+                               const std::optional<torch::Tensor>& probs,
+                               const std::string& compiled_dims) {
+    bf16_chunk_gemm_nt(a, b.transpose(1, 2), d, task_queue, task_idx, o2, probs, compiled_dims);
 }
 
 // Weighted SwiGLU for one chunk task: `o2[:, j] = silu(o1[:, 2j]) * o1[:, 2j + 1] * probs`
@@ -193,6 +203,11 @@ static void chunk_zip(const torch::Tensor& o3, const torch::Tensor& combine_inpu
 
 static void register_apis(pybind11::module_& m) {
 #if DG_TENSORMAP_COMPATIBLE
+    m.def("bf16_chunk_gemm_nt", &bf16_chunk_gemm_nt,
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("task_queue"), py::arg("task_idx"),
+          py::arg("o2") = std::nullopt, py::arg("probs") = std::nullopt,
+          py::arg("compiled_dims") = "nk");
     m.def("bf16_chunk_gemm_nn", &bf16_chunk_gemm_nn,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("task_queue"), py::arg("task_idx"),

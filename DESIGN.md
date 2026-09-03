@@ -39,7 +39,7 @@
 
 <b>关于chunk的说明：</b>其实通信并不是严格按chunk发送的，它相当于是细水长流地并发收到各个专家的token，然后push到各个专家的buffer上，我所谓的“概念上”指的是当一个专家每凑够chunk数量的token时，就理解为它的一个chunk到达了，并不是说一个chunk突然就一次性到达了。使用chunk这个概念是为了保证GEMM的连续性，因为我们是训练场景，如果每到一个token就计算，性能肯定非常差。
 
-<b>关于zip：</b>目前计算这边自己也实现了一个 zip，融合到 signal_done 里了，每个 chunk 调用一次；用于替代通信的 persistent zip，理论上可以给计算换更多的 SM；不过目前实测性能上相差无几，最终用哪个还没决定。
+<b>关于zip：</b>目前计算这边自己也实现了一个 zip，融合到 signal_done 里了，每个 chunk 调用一次，用于替代通信的 persistent zip，理论上可以给计算换更多的 SM；目前实测我们的 zip 性能更好，之后基本只维护我们的 zip 即可。
 
 
 ## 计算部分设计细节
@@ -115,3 +115,32 @@ done 算子需要维护以下两张表用于记录 token 完成情况：
 
 zip 和 combine 之间通过一个表记录每个 token 是否可以被 combine：
 `zip_done`[num_recv_tokens] int32 : 使用 DeepEP 序，仅使用 0/1 值表示，由 zip 向已经完成 zip 的 token 位置写 1
+
+
+### 反向Kernel
+
+先梳理一下计算部分的前向 kernel：
+* gateup: 调用 bf16_chunk_gemm_nn (x -> o1)
+* swiglu: 调用 chunk_weighted_swiglu 或与 gateup 融合 (o1,probs -> o2)
+* down: 调用 bf16_chunk_gemm_nn (o2 -> o3)
+* zip: 调用 chunk_zip (o3 -> out)
+
+那么根据反向的公式，反向所需的 kernel 为：
+* zip_grad: 不需要，由通信提供；zip_grad 本质上就是 unzip，只是数据搬运，无计算，unzip 已经融合在通信 kernel 里
+* down_grad: 调用 bf16_chunk_gemm_nt (do3 -> do2)
+* swiglu_grad: 这个最复杂，需要输入前向激活 o1 和 probs，重计算 o2' 给 wgrad 用，同时根据 do2 算出 do1，以及计算 dprobs；由于过于复杂，目前不和 down_grad 做融合 (o1,probs,do2 -> o2',do1,dprobs)
+* gateup_grad: 调用 bf16_chunk_gemm_nt (do1 -> dx)
+* unzip_grad: 调用 chunk_zip，对于 dx 是和前向一样的累加，但是对于 dprobs 实际上是 scatter 到 DeepEP 序的 recv_probs 上，这是一个和 recv_token_indices 相同 shape 和 token 槽位的 tensor，需要扩展以支持 (dx,dprobs -> drecv_x,drecv_probs)
+
+关于 nn/nt：两者底层实现相同，是同一个 kernel 模板 kMajorB 的两个实例化（nn 是 MN-major B，nt 是 K-major B，后者其实才是库里的原生形态）；信号等待和 chunk 调度逻辑完全共用，零转置零拷贝；nt 与 nn 在相同 (M,N,K) 下性能持平，见 tests_overlap/test_chunk_nt.py
+
+wgrad 不需要我们做，我们只要把 (x',do1)、(o2',do3) 给出即可，用户会调用专门的 k_group_gemm 算子来计算，wgrad 不在关键路径上；注意 padding 部分要置 0，do1 和 do3 可能需要专门后处理置 0，x' 和 o2' 作为新的输出也要专门处理
+
+但是这里有个很重要的顺序问题，就是前向 atomic 序和反向 atomic 序是不同的
+* 对于主干计算 (dout->do2、do1->dx、dx->drecv_x) 不用管，因为这些用的都是反向 atomic 序，token 位置能够对齐，unzip_grad (实际是 zip) 也能够恢复顺序
+* 但是对于 swiglu_grad 不是，因为它的输入 o1 和 probs 是前向 atomic 序，读的时候需要先转换成反向 atomic 序，它输出的 o2 也应该是反向 atomic 序
+* 另外，前向没有保存 x 激活，保存的是 recv_x (也就是没 unzip 的，使用 DeepEP 序)，我们可能需要写一个 wgrad 专用的 unzip 来解压出反向 atomic 序的 x'，不过这是后话了，先把主干梯度做出来
+
+注：DeepEP 用的是前反完全对称的实现（或者说它就没有反向的概念），combine 的反向就是一模一样的 dispatch，它在给我们反向 atomic 序的 do3（也就是 unzipped_tokens）的同时也会给出反向 atomic 序的 atomic_to_zip/zip_to_atomic；但是 recv_token_indices 是前反向相同的，包括 token 槽位也相同
+
+反向 atomic 序到前向 atomic 序转换的一种做法为：通过反向 atomic_to_zip 拿到一个 token 在 DeepEP 序中的位置 -> 通过 recv_token_indices 获取该 token 所属专家的槽位 -> 在前向 zip_to_atomic 的对应槽位中拿到该 token 在前向 atomic 序中的下标

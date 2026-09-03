@@ -59,7 +59,7 @@ try:
         m_grouped_bf16_gemm_nt_masked,
         k_grouped_bf16_gemm_tn_contiguous,
         # Chunk-wise kernels for compute-communication overlap
-        bf16_chunk_gemm_nn,
+        bf16_chunk_gemm_nt, bf16_chunk_gemm_nn,
         chunk_weighted_swiglu,
         chunk_signal_token_done,
         chunk_zip,
