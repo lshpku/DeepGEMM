@@ -61,6 +61,7 @@ try:
         # Chunk-wise kernels for compute-communication overlap
         bf16_chunk_gemm_nt, bf16_chunk_gemm_nn,
         chunk_weighted_swiglu,
+        chunk_weighted_swiglu_grad,
         chunk_signal_token_done,
         chunk_zip,
         num_chunk_task_fields,

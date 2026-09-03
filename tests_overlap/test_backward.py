@@ -24,7 +24,7 @@ TOPK = 8
 CHUNK = 4096
 NUM_SMS = 96
 ALIGNMENT = 128
-FUSE_SWIGLU = True
+FUSE_SWIGLU = False
 PRECISE_SWIGLU = True
 
 
@@ -258,6 +258,7 @@ def compute_chunk(recv_x_pad, recv_probs, topk_indices, w_gateup, w_down, dout_p
     dx = paddle.full_like(x, float("nan"))
     do1 = paddle.full_like(o1, float("nan"))
     do2 = paddle.full_like(o2, float("nan"))
+    drecv_probs = paddle.zeros_like(recv_probs)  # 无效位预先填0
     o2_bwd = paddle.full_like(o2, float("nan"))
     x_bwd = paddle.full_like(x, float("nan"))
 
@@ -267,9 +268,12 @@ def compute_chunk(recv_x_pad, recv_probs, topk_indices, w_gateup, w_down, dout_p
     paddle.base.core.nvprof_nvtx_push("backward")
     for task_idx in range(len(task_queue_bwd)):
         deep_gemm.bf16_chunk_gemm_nt(do3, w_down, do2, task_queue_bwd, task_idx)
+        deep_gemm.chunk_weighted_swiglu_grad(
+            o1, probs, do2, o2_bwd, do1, drecv_probs, atomic_to_zip_bwd, zip_to_atomic,
+            topk_indices, task_queue_bwd, task_idx, precise=PRECISE_SWIGLU)
     paddle.base.core.nvprof_nvtx_pop()
 
-    drecv_x = drecv_probs = None
+    drecv_x = None
 
     return Result(o1, o2, o3, out, do2, do1, dx, drecv_x, drecv_probs, o2_bwd, x_bwd)
 
@@ -331,10 +335,13 @@ def main():
 
     for name in ("o1", "o2", "o3"):
         print(f"{name}:", check(outs[name][fwd_perm], refs[name]))
-    for name in ("out",):
+    for name in ("out", "drecv_probs"):
         print(f"{name}:", check(outs[name], refs[name]))
-    for name in ("do2",):
+    for name in ("do2", "do1"):
         print(f"{name}:", check(outs[name][bwd_perm], refs[name]))
+
+    print("o2_bwd vs ref:", check(outs["o2_bwd"][bwd_perm], refs["o2"]))
+    print("o2_bwd vs fwd:", check(outs["o2_bwd"][bwd_perm], outs["o2"][fwd_perm]))
 
 
 if __name__ == "__main__":

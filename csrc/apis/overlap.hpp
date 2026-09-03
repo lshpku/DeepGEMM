@@ -6,6 +6,7 @@
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
 #include "../jit_kernels/impls/smxx_chunk_token_done.hpp"
 #include "../jit_kernels/impls/smxx_chunk_weighted_swiglu.hpp"
+#include "../jit_kernels/impls/smxx_chunk_weighted_swiglu_grad.hpp"
 #include "../jit_kernels/impls/smxx_chunk_zip.hpp"
 #endif
 
@@ -103,6 +104,70 @@ static void chunk_weighted_swiglu(const torch::Tensor& o1, const torch::Tensor& 
     DG_HOST_ASSERT(0 <= task_idx and task_idx < task_queue.size(0));
 
     smxx_chunk_weighted_swiglu(o1, probs, o2, task_queue, task_idx, precise);
+}
+
+// Backward of the weighted SwiGLU for one chunk task: `(o1, probs, do2) -> (o2_bwd, do1, drecv_probs)`
+// NOTES: `o1` and `probs` are forward activations, so they are indexed in the forward atomic
+//        order, while `do2` and both row outputs are in the backward one; a row is mapped
+//        across the two by its unduplicated token, i.e. `atomic_to_zip` (backward) gives the
+//        token, the task gives the expert, and `zip_to_atomic` (forward) gives the forward row
+// NOTES: `o2_bwd` is the forward `o2` recomputed for the `w_down` weight gradient, and with
+//        `precise` it reproduces the forward bit for bit
+// NOTES: the `probs` gradient needs no reduction over the experts, as a row owns exactly one
+//        `(token, slot)` pair, so it lands straight in its final `[num_recv_tokens, num_topk]`
+//        slot; the slots of a token's non-local experts are never written, hence `drecv_probs`
+//        must arrive zeroed
+// NOTES: the chunk's padded tail is zeroed in `do1`/`o2_bwd`, as they feed the weight gradients,
+//        where the other operand's garbage rows would poison the result
+static void chunk_weighted_swiglu_grad(const torch::Tensor& o1, const torch::Tensor& probs,
+                                       const torch::Tensor& do2,
+                                       const torch::Tensor& o2_bwd, const torch::Tensor& do1,
+                                       const torch::Tensor& drecv_probs,
+                                       const torch::Tensor& atomic_to_zip,
+                                       const torch::Tensor& zip_to_atomic,
+                                       const torch::Tensor& recv_token_indices,
+                                       const torch::Tensor& task_queue,
+                                       const int& task_idx,
+                                       const bool& precise) {
+    // The row-indexed tensors all share the unzipped layout, which is the same in both orders
+    const auto [m, n2] = get_shape<2>(o1);
+    const auto [m_, n] = get_shape<2>(do2);
+    DG_HOST_ASSERT(m == m_ and n2 == n * 2);
+    for (const auto& t: {o1, do1}) {
+        DG_HOST_ASSERT(t.sizes() == o1.sizes() and t.scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(t.is_contiguous());
+    }
+    for (const auto& t: {do2, o2_bwd}) {
+        DG_HOST_ASSERT(t.sizes() == do2.sizes() and t.scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(t.is_contiguous());
+    }
+    DG_HOST_ASSERT(probs.is_contiguous() and probs.dim() == 1);
+    DG_HOST_ASSERT(static_cast<int>(probs.numel()) == m);
+    DG_HOST_ASSERT(probs.scalar_type() == torch::kFloat);
+
+    // `atomic_to_zip` follows the rows, the top-k tables and `drecv_probs` the tokens
+    DG_HOST_ASSERT(atomic_to_zip.is_contiguous() and atomic_to_zip.dim() == 1);
+    DG_HOST_ASSERT(static_cast<int>(atomic_to_zip.numel()) == m);
+    DG_HOST_ASSERT(atomic_to_zip.scalar_type() == torch::kInt);
+    const auto [num_recv_tokens, num_topk] = get_shape<2>(zip_to_atomic);
+    const auto [num_recv_tokens_, num_topk_] = get_shape<2>(recv_token_indices);
+    const auto [num_recv_tokens__, num_topk__] = get_shape<2>(drecv_probs);
+    DG_HOST_ASSERT(num_recv_tokens_ == num_recv_tokens and num_topk_ == num_topk);
+    DG_HOST_ASSERT(num_recv_tokens__ == num_recv_tokens and num_topk__ == num_topk);
+    DG_HOST_ASSERT(num_topk <= 32);
+    DG_HOST_ASSERT(zip_to_atomic.is_contiguous() and zip_to_atomic.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(recv_token_indices.is_contiguous() and recv_token_indices.scalar_type() == torch::kLong);
+    DG_HOST_ASSERT(drecv_probs.is_contiguous() and drecv_probs.scalar_type() == torch::kFloat);
+
+    // The task queue is `[num_tasks, kNumChunkTaskFields]` on the device
+    DG_HOST_ASSERT(task_queue.is_contiguous());
+    DG_HOST_ASSERT(task_queue.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(task_queue.dim() == 2 and task_queue.size(1) == kNumChunkTaskFields);
+    DG_HOST_ASSERT(0 <= task_idx and task_idx < task_queue.size(0));
+
+    smxx_chunk_weighted_swiglu_grad(o1, probs, do2, o2_bwd, do1, drecv_probs,
+                                    atomic_to_zip, zip_to_atomic, recv_token_indices,
+                                    task_queue, task_idx, precise);
 }
 
 // Publish the token completion of one chunk, to be issued right after its down GEMM
@@ -215,6 +280,12 @@ static void register_apis(pybind11::module_& m) {
           py::arg("compiled_dims") = "nk");
     m.def("chunk_weighted_swiglu", &chunk_weighted_swiglu,
           py::arg("o1"), py::arg("probs"), py::arg("o2"),
+          py::arg("task_queue"), py::arg("task_idx"),
+          py::arg("precise") = false);
+    m.def("chunk_weighted_swiglu_grad", &chunk_weighted_swiglu_grad,
+          py::arg("o1"), py::arg("probs"), py::arg("do2"),
+          py::arg("o2_bwd"), py::arg("do1"), py::arg("drecv_probs"),
+          py::arg("atomic_to_zip"), py::arg("zip_to_atomic"), py::arg("recv_token_indices"),
           py::arg("task_queue"), py::arg("task_idx"),
           py::arg("precise") = false);
     m.def("chunk_signal_token_done", &chunk_signal_token_done,

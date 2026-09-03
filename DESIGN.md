@@ -128,13 +128,15 @@ zip 和 combine 之间通过一个表记录每个 token 是否可以被 combine�
 那么根据反向的公式，反向所需的 kernel 为：
 * zip_grad: 不需要，由通信提供；zip_grad 本质上就是 unzip，只是数据搬运，无计算，unzip 已经融合在通信 kernel 里
 * down_grad: 调用 bf16_chunk_gemm_nt (do3 -> do2)
-* swiglu_grad: 这个最复杂，需要输入前向激活 o1 和 probs，重计算 o2' 给 wgrad 用，同时根据 do2 算出 do1，以及计算 dprobs；由于过于复杂，目前不和 down_grad 做融合 (o1,probs,do2 -> o2',do1,dprobs)
+* swiglu_grad: 这个最复杂，需要输入前向激活 o1 和 probs，重计算 o2' 给 wgrad 用，同时根据 do2 算出 do1，以及计算 dprobs_recv；由于过于复杂，目前不和 down_grad 做融合 (o1,probs,do2 -> o2',do1,dprobs_recv)
 * gateup_grad: 调用 bf16_chunk_gemm_nt (do1 -> dx)
-* unzip_grad: 调用 chunk_zip，对于 dx 是和前向一样的累加，但是对于 dprobs 实际上是 scatter 到 DeepEP 序的 recv_probs 上，这是一个和 recv_token_indices 相同 shape 和 token 槽位的 tensor，需要扩展以支持 (dx,dprobs -> drecv_x,drecv_probs)
+* unzip_grad: 调用 chunk_zip，累加方式和前向相同 (dx -> drecv_x)
 
 关于 nn/nt：两者底层实现相同，是同一个 kernel 模板 kMajorB 的两个实例化（nn 是 MN-major B，nt 是 K-major B，后者其实才是库里的原生形态）；信号等待和 chunk 调度逻辑完全共用，零转置零拷贝；nt 与 nn 在相同 (M,N,K) 下性能持平，见 tests_overlap/test_chunk_nt.py
 
 wgrad 不需要我们做，我们只要把 (x',do1)、(o2',do3) 给出即可，用户会调用专门的 k_group_gemm 算子来计算，wgrad 不在关键路径上；注意 padding 部分要置 0，do1 和 do3 可能需要专门后处理置 0，x' 和 o2' 作为新的输出也要专门处理
+
+drecv_probs 是一个和 recv_token_indices 相同 shape 和 token 槽位的 tensor，算出每个 token 的 dprob 后直接 scatter 到 drecv_probs 中，后续无累加操作
 
 但是这里有个很重要的顺序问题，就是前向 atomic 序和反向 atomic 序是不同的
 * 对于主干计算 (dout->do2、do1->dx、dx->drecv_x) 不用管，因为这些用的都是反向 atomic 序，token 位置能够对齐，unzip_grad (实际是 zip) 也能够恢复顺序
