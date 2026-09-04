@@ -16,7 +16,7 @@ public:
     struct Args {
         LaunchArgs launch_args;
 
-        int num_sms, num_threads, num_warps_per_row, num_topk;
+        int num_sms, num_threads, num_topk;
         int num_vecs_per_row, num_elems_per_access;
         bool precise;
         void* task_queue;
@@ -41,12 +41,12 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&smxx_chunk_weighted_swiglu_grad_impl<
-        {}, {}, {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}
     >);
 }};
 )",
-        args.num_sms, args.num_threads, args.num_warps_per_row, args.num_topk,
-        args.num_vecs_per_row, args.num_elems_per_access, args.precise);
+        args.num_sms, args.num_threads, args.num_topk, args.num_vecs_per_row,
+        args.num_elems_per_access, args.precise);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -72,34 +72,18 @@ static void smxx_chunk_weighted_swiglu_grad(const torch::Tensor& o1,
                                             const torch::Tensor& task_queue,
                                             const int& task_idx,
                                             const bool& precise) {
-    constexpr int kNumThreads = 1024;
     constexpr int kNumElemsPerAccess = 8;
-    // NOTES: more vectors per lane would put more loads in flight and more rows in flight per
-    //        CTA, and it did measure faster, but 2 and 4 both hit a `cudaErrorIllegalAddress`
-    //        that only the `precise == false` instantiation shows, that `compute-sanitizer`
-    //        cannot see, and that survives having every index bound checked on the device; it
-    //        moves with unrelated codegen changes, so keep one vector per lane until it is
-    //        understood, and re-run `tests_overlap/test_backward.py` in both modes if it changes
-    constexpr int kNumVecsPerThread = 1;
 
     const auto num_sms = device_runtime->get_num_sms();
+    const auto num_threads = precise ? 512 : 1024;
     const auto shape_n = static_cast<int>(do2.size(-1));
     DG_HOST_ASSERT(shape_n % kNumElemsPerAccess == 0);
     const auto num_vecs_per_row = shape_n / kNumElemsPerAccess;
 
-    // One row is owned by as many warps as cover it in `kNumVecsPerThread` steps, so that the
-    // `probs` gradient reduction stays inside one group and the row's traffic stays contiguous
-    DG_HOST_ASSERT(num_vecs_per_row % 32 == 0);
-    const auto num_warps_per_row = std::max(1, std::min(kNumThreads / 32,
-                                                        num_vecs_per_row / 32 / kNumVecsPerThread));
-    DG_HOST_ASSERT(num_vecs_per_row % (num_warps_per_row * 32) == 0);
-    DG_HOST_ASSERT((kNumThreads / 32) % num_warps_per_row == 0);
-
     const SMXXChunkWeightedSwigluGradRuntime::Args args = {
-        .launch_args = LaunchArgs(num_sms, kNumThreads),
+        .launch_args = LaunchArgs(num_sms, num_threads),
         .num_sms = num_sms,
-        .num_threads = kNumThreads,
-        .num_warps_per_row = num_warps_per_row,
+        .num_threads = num_threads,
         .num_topk = static_cast<int>(zip_to_atomic.size(-1)),
         .num_vecs_per_row = num_vecs_per_row,
         .num_elems_per_access = kNumElemsPerAccess,

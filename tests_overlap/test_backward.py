@@ -14,6 +14,10 @@ paddle.seed(0)
 import deep_gemm
 print("deep_gemm:", deep_gemm.__path__)
 
+# 使用特别编译的注释掉 deep_gemm 的版本, 不然会和我们的头文件冲突
+import paddlefleet_ops
+assert not paddlefleet_ops._DEEP_GEMM_AVAILABLE
+
 E = 16
 H = 4096
 I = 2048
@@ -164,10 +168,10 @@ def reference(recv_x, recv_probs, topk_indices, tokens_per_expert, m_indices, w_
     deep_gemm.m_grouped_bf16_gemm_nn_contiguous(x, w_gateup, o1, m_indices)
 
     o1.stop_gradient = False
-    unzipped_probs.stop_gradient = False
     gate, up = split_gate_up(o1)
-    gate, up = gate.float(), up.float()
-    o2 = ((gate * F.sigmoid(gate)) * up * unzipped_probs.unsqueeze(-1)).cast("bfloat16")
+    # gate, up = gate.float(), up.float()
+    # o2 = ((gate * F.sigmoid(gate)) * up * unzipped_probs.unsqueeze(-1)).cast("bfloat16")
+    o2 = paddlefleet_ops.fused_swiglu_scale(paddle.concat([gate, up], axis=-1), unzipped_probs)
 
     o3 = paddle.empty([len(x), H], dtype="bfloat16")
     deep_gemm.m_grouped_bf16_gemm_nn_contiguous(o2, w_down, o3, m_indices)
@@ -196,9 +200,11 @@ def reference(recv_x, recv_probs, topk_indices, tokens_per_expert, m_indices, w_
     do2 = paddle.empty_like(o2)
     deep_gemm.m_grouped_bf16_gemm_nt_contiguous(do3, w_down, do2, m_indices)
 
-    o2.backward(do2)
+    dgateup, dprobs = paddlefleet_ops.fused_swiglu_scale_bwd(
+        paddle.concat([gate, up], axis=-1), unzipped_probs, do2)
+    dgate, dup = dgateup.chunk(2, axis=-1)
+    paddle.autograd.backward([gate, up], [dgate, dup])
     do1 = o1.grad
-    dprobs = unzipped_probs.grad
 
     dx = paddle.empty_like(x)
     deep_gemm.m_grouped_bf16_gemm_nt_contiguous(do1, w_gateup, dx, m_indices)
@@ -267,10 +273,12 @@ def compute_chunk(recv_x_pad, recv_probs, topk_indices, w_gateup, w_down, dout_p
 
     paddle.base.core.nvprof_nvtx_push("backward")
     for task_idx in range(len(task_queue_bwd)):
+        paddle.base.core.nvprof_nvtx_push(f"task_{task_idx}")
         deep_gemm.bf16_chunk_gemm_nt(do3, w_down, do2, task_queue_bwd, task_idx)
         deep_gemm.chunk_weighted_swiglu_grad(
             o1, probs, do2, o2_bwd, do1, drecv_probs, atomic_to_zip_bwd, zip_to_atomic,
             topk_indices, task_queue_bwd, task_idx, precise=PRECISE_SWIGLU)
+        paddle.base.core.nvprof_nvtx_pop()
     paddle.base.core.nvprof_nvtx_pop()
 
     drecv_x = None
