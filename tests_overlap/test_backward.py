@@ -33,6 +33,7 @@ PRECISE_SWIGLU = True
 
 
 class Result(NamedTuple):
+    x: Tensor
     o1: Tensor
     o2: Tensor
     o3: Tensor
@@ -43,7 +44,6 @@ class Result(NamedTuple):
     drecv_x: Tensor
     drecv_probs: Tensor
     o2_bwd: Tensor = None
-    x_bwd: Tensor = None
 
     def __getitem__(self, key: str):
         return getattr(self, key)
@@ -218,7 +218,7 @@ def reference(recv_x, recv_probs, topk_indices, tokens_per_expert, m_indices, w_
         num_experts=E,
     )
 
-    return Result(o1, o2, o3, out, do2, do1, dx, drecv_x, drecv_probs)
+    return Result(x, o1, o2, o3, out, do2, do1, dx, drecv_x, drecv_probs)
 
 
 def compute_chunk(recv_x_pad, recv_probs, topk_indices, w_gateup, w_down, dout_pad,
@@ -259,14 +259,15 @@ def compute_chunk(recv_x_pad, recv_probs, topk_indices, w_gateup, w_down, dout_p
 
     ################################# Backward #################################
 
+    x = recv_x_pad[atomic_to_zip_bwd]
     do3 = dout_pad[atomic_to_zip_bwd]
 
     dx = paddle.full_like(x, float("nan"))
     do1 = paddle.full_like(o1, float("nan"))
     do2 = paddle.full_like(o2, float("nan"))
+    drecv_x = paddle.full_like(out, float("nan"))
     drecv_probs = paddle.zeros_like(recv_probs)  # 无效位预先填0
     o2_bwd = paddle.full_like(o2, float("nan"))
-    x_bwd = paddle.full_like(x, float("nan"))
 
     token_done = paddle.zeros([len(recv_probs)], dtype="int32")
     zip_done = paddle.zeros([len(recv_probs)], dtype="int32")
@@ -278,12 +279,13 @@ def compute_chunk(recv_x_pad, recv_probs, topk_indices, w_gateup, w_down, dout_p
         deep_gemm.chunk_weighted_swiglu_grad(
             o1, probs, do2, o2_bwd, do1, drecv_probs, atomic_to_zip_bwd, zip_to_atomic,
             topk_indices, task_queue_bwd, task_idx, precise=PRECISE_SWIGLU)
+        deep_gemm.bf16_chunk_gemm_nt(do1, w_gateup, dx, task_queue_bwd, task_idx)
+        deep_gemm.chunk_zip(dx, drecv_x, atomic_to_zip_bwd, zip_to_atomic_bwd, topk_indices,
+                            num_valid_topk, token_done, zip_done, task_queue_bwd, task_idx, CHUNK)
         paddle.base.core.nvprof_nvtx_pop()
     paddle.base.core.nvprof_nvtx_pop()
 
-    drecv_x = None
-
-    return Result(o1, o2, o3, out, do2, do1, dx, drecv_x, drecv_probs, o2_bwd, x_bwd)
+    return Result(x, o1, o2, o3, out, do2, do1, dx, drecv_x, drecv_probs, o2_bwd)
 
 
 def get_atomic_perm(tokens_per_expert, m_start, atomic_to_zip):
@@ -296,7 +298,11 @@ def get_atomic_perm(tokens_per_expert, m_start, atomic_to_zip):
 
 def check(x, y):
     diff = (x.float() - y.float()).abs()
-    return f"avg: {diff.mean():e} max: {diff.max():e}"
+    avg, max = float(diff.mean()), float(diff.max())
+    banner = (" " + "-" * 40) if (avg or max) else ""
+    avg = "0" if avg == 0 else f"{avg:e}"
+    max = "0" if max == 0 else f"{max:e}"
+    return f"avg: {avg} max: {max}" + banner
 
 
 def main():
@@ -343,9 +349,9 @@ def main():
 
     for name in ("o1", "o2", "o3"):
         print(f"{name}:", check(outs[name][fwd_perm], refs[name]))
-    for name in ("out", "drecv_probs"):
+    for name in ("out", "drecv_x", "drecv_probs"):
         print(f"{name}:", check(outs[name], refs[name]))
-    for name in ("do2", "do1"):
+    for name in ("do2", "do1", "dx", "x"):
         print(f"{name}:", check(outs[name][bwd_perm], refs[name]))
 
     print("o2_bwd vs ref:", check(outs["o2_bwd"][bwd_perm], refs["o2"]))
