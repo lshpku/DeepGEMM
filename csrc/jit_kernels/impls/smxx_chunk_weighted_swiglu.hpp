@@ -18,7 +18,7 @@ public:
 
         int num_sms, num_threads, num_elems_per_access;
         int num_vecs_per_row, num_vecs_per_thread;
-        bool precise;
+        bool precise, interleaved;
         void* task_queue;
         uint32_t task_idx;
         void* o1;
@@ -35,12 +35,12 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&smxx_chunk_weighted_swiglu_impl<
-        {}, {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}, {}
     >);
 }};
 )",
-        args.num_sms, args.num_threads, args.num_elems_per_access,
-        args.num_vecs_per_row, args.num_vecs_per_thread, args.precise);
+        args.num_sms, args.num_threads, args.num_elems_per_access, args.num_vecs_per_row,
+        args.num_vecs_per_thread, args.precise, args.interleaved);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -57,12 +57,11 @@ static void smxx_chunk_weighted_swiglu(const torch::Tensor& o1,
                                        const torch::Tensor& o2,
                                        const torch::Tensor& task_queue,
                                        const int& task_idx,
-                                       const bool& precise) {
+                                       const bool& precise,
+                                       const bool& interleaved) {
     constexpr int kNumThreads = 1024;
     constexpr int kNumElemsPerAccess = 8;
-    // NOTES: one vector already issues two loads with the interleaved layout, so a single
-    //        vector per thread keeps enough in flight; sweeping 2/4/8 only made it slower
-    constexpr int kNumVecsPerThread = 1;
+    constexpr int kNumVecsPerThread = 2;
 
     const auto num_sms = device_runtime->get_num_sms();
     const auto shape_n = static_cast<int>(o2.size(-1));
@@ -76,6 +75,7 @@ static void smxx_chunk_weighted_swiglu(const torch::Tensor& o1,
         .num_vecs_per_row = shape_n / kNumElemsPerAccess,
         .num_vecs_per_thread = kNumVecsPerThread,
         .precise = precise,
+        .interleaved = interleaved,
         .task_queue = task_queue.data_ptr(),
         .task_idx = static_cast<uint32_t>(task_idx),
         .o1 = o1.data_ptr(),

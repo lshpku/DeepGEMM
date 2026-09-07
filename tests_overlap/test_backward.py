@@ -30,6 +30,7 @@ NUM_SMS = 96
 ALIGNMENT = 128
 FUSE_SWIGLU = False
 PRECISE_SWIGLU = True
+INTERLEAVED = False
 
 
 class Result(NamedTuple):
@@ -143,10 +144,8 @@ def interleave_gateup(w_gateup):
     return w_gateup.index_select(paddle.to_tensor(perm), axis=2).contiguous()
 
 
-def split_gate_up(o1):
-    """The gate/up halves of `o1`, which is in the fully interleaved column order."""
-    blocks = o1.reshape([o1.shape[0], I, 2])
-    return blocks[:, :, 0], blocks[:, :, 1]
+def deinterleave_gateup(w_gateup):
+    return paddle.concat([w_gateup[..., 0::2], w_gateup[..., 1::2]], axis=-1)
 
 
 def reference(recv_x, recv_probs, topk_indices, tokens_per_expert, m_indices, w_gateup, w_down, dout):
@@ -167,11 +166,10 @@ def reference(recv_x, recv_probs, topk_indices, tokens_per_expert, m_indices, w_
     o1 = paddle.empty([len(x), 2 * I], dtype="bfloat16")
     deep_gemm.m_grouped_bf16_gemm_nn_contiguous(x, w_gateup, o1, m_indices)
 
-    o1.stop_gradient = False
-    gate, up = split_gate_up(o1)
+    # gate, up = o1.chunk(2, axis=-1)
     # gate, up = gate.float(), up.float()
     # o2 = ((gate * F.sigmoid(gate)) * up * unzipped_probs.unsqueeze(-1)).cast("bfloat16")
-    o2 = paddlefleet_ops.fused_swiglu_scale(paddle.concat([gate, up], axis=-1), unzipped_probs)
+    o2 = paddlefleet_ops.fused_swiglu_scale(o1, unzipped_probs)
 
     o3 = paddle.empty([len(x), H], dtype="bfloat16")
     deep_gemm.m_grouped_bf16_gemm_nn_contiguous(o2, w_down, o3, m_indices)
@@ -200,11 +198,7 @@ def reference(recv_x, recv_probs, topk_indices, tokens_per_expert, m_indices, w_
     do2 = paddle.empty_like(o2)
     deep_gemm.m_grouped_bf16_gemm_nt_contiguous(do3, w_down, do2, m_indices)
 
-    dgateup, dprobs = paddlefleet_ops.fused_swiglu_scale_bwd(
-        paddle.concat([gate, up], axis=-1), unzipped_probs, do2)
-    dgate, dup = dgateup.chunk(2, axis=-1)
-    paddle.autograd.backward([gate, up], [dgate, dup])
-    do1 = o1.grad
+    do1, dprobs = paddlefleet_ops.fused_swiglu_scale_bwd(o1, unzipped_probs, do2)
 
     dx = paddle.empty_like(x)
     deep_gemm.m_grouped_bf16_gemm_nt_contiguous(do1, w_gateup, dx, m_indices)
@@ -250,8 +244,8 @@ def compute_chunk(recv_x_pad, recv_probs, topk_indices, w_gateup, w_down, dout_p
             deep_gemm.bf16_chunk_gemm_nn(x, w_gateup, o1, task_queue, task_idx, o2=o2, probs=probs)
         else:
             deep_gemm.bf16_chunk_gemm_nn(x, w_gateup, o1, task_queue, task_idx)
-            deep_gemm.chunk_weighted_swiglu(
-                o1, probs, o2, task_queue, task_idx, precise=PRECISE_SWIGLU)
+            deep_gemm.chunk_weighted_swiglu(o1, probs, o2, task_queue, task_idx,
+                                            precise=PRECISE_SWIGLU, interleaved=INTERLEAVED)
         deep_gemm.bf16_chunk_gemm_nn(o2, w_down, o3, task_queue, task_idx)
         deep_gemm.chunk_zip(o3, out, atomic_to_zip, zip_to_atomic, topk_indices, num_valid_topk,
                             token_done, zip_done, task_queue, task_idx, CHUNK)
@@ -278,7 +272,8 @@ def compute_chunk(recv_x_pad, recv_probs, topk_indices, w_gateup, w_down, dout_p
         deep_gemm.bf16_chunk_gemm_nt(do3, w_down, do2, task_queue_bwd, task_idx)
         deep_gemm.chunk_weighted_swiglu_grad(
             o1, probs, do2, o2_bwd, do1, drecv_probs, atomic_to_zip_bwd, zip_to_atomic,
-            topk_indices, task_queue_bwd, task_idx, precise=PRECISE_SWIGLU)
+            topk_indices, task_queue_bwd, task_idx, precise=PRECISE_SWIGLU,
+            interleaved=INTERLEAVED)
         deep_gemm.bf16_chunk_gemm_nt(do1, w_gateup, dx, task_queue_bwd, task_idx)
         deep_gemm.chunk_zip(dx, drecv_x, atomic_to_zip_bwd, zip_to_atomic_bwd, topk_indices,
                             num_valid_topk, token_done, zip_done, task_queue_bwd, task_idx, CHUNK)
@@ -321,11 +316,12 @@ def main():
     recv_probs = paddle.randn(topk_indices.shape)
     w_gateup = paddle.randn([E, H, 2 * I], dtype="bfloat16") * 0.02
     w_down = paddle.randn([E, I, H], dtype="bfloat16") * 0.02
+    w_gateup_ref = deinterleave_gateup(w_gateup) if INTERLEAVED else w_gateup
 
     ################################# Baseline #################################
 
     refs = reference(recv_x, recv_probs, topk_indices, tokens_per_expert, m_indices,
-                     w_gateup, w_down, dout)
+                     w_gateup_ref, w_down, dout)
 
     ################################## Chunk ###################################
 
@@ -347,12 +343,19 @@ def main():
     fwd_perm = get_atomic_perm(tokens_per_expert, m_start, atomic_to_zip)
     bwd_perm = get_atomic_perm(tokens_per_expert, m_start, atomic_to_zip_bwd)
 
-    for name in ("o1", "o2", "o3"):
-        print(f"{name}:", check(outs[name][fwd_perm], refs[name]))
-    for name in ("out", "drecv_x", "drecv_probs"):
-        print(f"{name}:", check(outs[name], refs[name]))
-    for name in ("do2", "do1", "dx", "x"):
-        print(f"{name}:", check(outs[name][bwd_perm], refs[name]))
+    checks = [
+        (("o1", "o2", "o3"), fwd_perm),
+        (("out",), None),
+        (("x", "do2", "do1", "dx"), bwd_perm),
+        (("drecv_x", "drecv_probs"), None),
+    ]
+
+    for names, perm in checks:
+        for name in names:
+            out, ref = outs[name], refs[name]
+            out = out[perm] if perm is not None else out
+            out = deinterleave_gateup(out) if (INTERLEAVED and "o1" in name) else out
+            print(f"{name}:", check(out, ref))
 
     print("o2_bwd vs ref:", check(outs["o2_bwd"][bwd_perm], refs["o2"]))
     print("o2_bwd vs fwd:", check(outs["o2_bwd"][bwd_perm], outs["o2"][fwd_perm]))
