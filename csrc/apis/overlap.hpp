@@ -129,6 +129,7 @@ static void chunk_weighted_swiglu_grad(const torch::Tensor& o1, const torch::Ten
                                        const torch::Tensor& recv_token_indices,
                                        const torch::Tensor& task_queue,
                                        const int& task_idx,
+                                       const int& chunk_size,
                                        const bool& precise,
                                        const bool& interleaved) {
     // The row-indexed tensors all share the unzipped layout, which is the same in both orders
@@ -167,9 +168,12 @@ static void chunk_weighted_swiglu_grad(const torch::Tensor& o1, const torch::Ten
     DG_HOST_ASSERT(task_queue.dim() == 2 and task_queue.size(1) == kNumChunkTaskFields);
     DG_HOST_ASSERT(0 <= task_idx and task_idx < task_queue.size(0));
 
+    // The chunk size only decides the number of blocks, so any upper bound works
+    DG_HOST_ASSERT(chunk_size > 0);
+
     smxx_chunk_weighted_swiglu_grad(o1, probs, do2, o2_bwd, do1, drecv_probs,
                                     atomic_to_zip, zip_to_atomic, recv_token_indices,
-                                    task_queue, task_idx, precise, interleaved);
+                                    task_queue, task_idx, chunk_size, precise, interleaved);
 }
 
 // Publish the token completion of one chunk, to be issued right after its down GEMM
@@ -288,7 +292,7 @@ static void register_apis(pybind11::module_& m) {
           py::arg("o1"), py::arg("probs"), py::arg("do2"),
           py::arg("o2_bwd"), py::arg("do1"), py::arg("drecv_probs"),
           py::arg("atomic_to_zip"), py::arg("zip_to_atomic"), py::arg("recv_token_indices"),
-          py::arg("task_queue"), py::arg("task_idx"),
+          py::arg("task_queue"), py::arg("task_idx"), py::arg("chunk_size"),
           py::arg("precise") = false, py::arg("interleaved") = false);
     m.def("chunk_signal_token_done", &chunk_signal_token_done,
           py::arg("atomic_to_zip"), py::arg("num_valid_topk"), py::arg("token_done"),

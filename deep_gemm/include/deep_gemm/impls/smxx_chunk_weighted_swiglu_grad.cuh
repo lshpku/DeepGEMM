@@ -20,9 +20,9 @@ namespace deep_gemm {
 //
 // NOTES: the chunk's padded tail is zeroed, as `do1`/`o2_bwd` feed the weight gradients, where
 //        a `0 * garbage` product of the other operand would still poison the accumulator
-template <uint32_t kNumSMs, uint32_t kNumThreads, uint32_t kNumTopk, uint32_t kNumVecsPerRow,
+template <uint32_t kNumThreads, uint32_t kNumTopk, uint32_t kNumVecsPerRow,
           uint32_t kNumElemsPerAccess, bool kPrecise, bool kInterleaved>
-CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
+CUTLASS_GLOBAL void __launch_bounds__(kNumThreads)
 smxx_chunk_weighted_swiglu_grad_impl(const int* task_queue, uint32_t task_idx,
                                      const cutlass::bfloat16_t* __restrict__ o1,
                                      const float* __restrict__ probs,
@@ -47,43 +47,33 @@ smxx_chunk_weighted_swiglu_grad_impl(const int* task_queue, uint32_t task_idx,
     // Wait for the producer (the down-grad GEMM) when PDL is enabled
     cudaGridDependencySynchronize();
 
-    // Claim the task: `[expert_idx, m_start, m_size, ready]`
-    __shared__ int smem_task[4];
+    // Claim the task: `[expert_idx, m_start, m_size, ready]` without fence
+    const auto task = __ldg(reinterpret_cast<const int4*>(task_queue) + task_idx);
+    const auto expert_idx = task.x;
+    const auto m_start = static_cast<uint32_t>(task.y);
+    const auto m_size = static_cast<uint32_t>(task.z);
     if (threadIdx.x == 0) {
-        const auto timed_out = chunk::wait_task_ready(task_queue, task_idx);
-        chunk::stage_task(smem_task, chunk::read_task(task_queue, task_idx));
-        smem_task[3] = timed_out ? 1 : 0;
+        const auto ready = static_cast<bool>(task.w);
+        DG_TRAP_ONLY_DEVICE_ASSERT(ready);
     }
-    __syncthreads();
-    DG_TRAP_ONLY_DEVICE_ASSERT(smem_task[3] == 0);
-    const auto task = chunk::load_staged_task(smem_task);
-    const auto m_start = static_cast<uint32_t>(task.m_start);
-    const auto m_size = static_cast<uint32_t>(task.m_size);
-    const auto expert_idx = task.expert_idx;
+
+    const auto m_aligned = math::ceil_div(m_size, m_alignment) * m_alignment;
+    if (blockIdx.x >= m_aligned)
+        return;
 
     const auto lane_idx = ptx::get_lane_idx();
     const auto warp_idx = threadIdx.x / 32;
 
-    // Partition the rows evenly across CTAs
-    const auto m_aligned = math::ceil_div(m_size, m_alignment) * m_alignment;
-    const auto rows_per_cta = math::ceil_div(m_aligned, kNumSMs);
-    const auto row_begin = blockIdx.x * rows_per_cta;
-    const auto row_end = min(row_begin + rows_per_cta, m_aligned);
+    __shared__ uint32_t smem_fwd_row;
+    uint32_t slot;
+    bool owns_slot = false;
 
-    __shared__ float smem_dprobs_sum[kNumThreads][kSumStride];
-    auto* dprobs_sum = smem_dprobs_sum[threadIdx.x];
-
-    // Iterate over m_size, each warp handles one row per loop
-    for (uint32_t it = row_begin + warp_idx; it < row_end; it += kNumWarps) {
-        const uint32_t bwd_row = m_start + it;
-        uint32_t fwd_row = bwd_row;
-        uint64_t slot = 0;
-        bool owns_slot = false;
-
-        // Map the bwd_row in backward atomic order to forward atomic order
-        // NOTES: only the real rows get mapped, padding rows use the same bwd_row as fwd_row.
-        //        This is valid because paddings are always on the end of each expert
-        if (it < m_size) {
+    // Map the bwd_row in backward atomic order to forward atomic order
+    // NOTES: only the real rows get mapped, padding rows use the same bwd_row as fwd_row.
+    //        This is valid because paddings are always on the end of each expert
+    if (warp_idx == 0) {
+        if (blockIdx.x < m_size) {
+            const auto bwd_row = m_start + blockIdx.x;
             const auto token_idx = atomic_to_zip[bwd_row];
             DG_TRAP_ONLY_DEVICE_ASSERT(token_idx >= 0);
 
@@ -94,115 +84,129 @@ smxx_chunk_weighted_swiglu_grad_impl(const int* task_queue, uint32_t task_idx,
             const auto bits = __ballot_sync(0xffffffff, owns_slot);
             DG_TRAP_ONLY_DEVICE_ASSERT(__popc(bits) == 1);
 
-            if (owns_slot)
-                fwd_row = zip_to_atomic[slot];
-            fwd_row = __shfl_sync(0xffffffff, fwd_row, __ffs(bits) - 1);
+            if (owns_slot) {
+                const auto fwd_row = zip_to_atomic[slot];
+                DG_TRAP_ONLY_DEVICE_ASSERT(fwd_row >= 0);
+                smem_fwd_row = static_cast<uint32_t>(fwd_row);
+            }
+        }
+    }
+    __syncthreads();
+
+    // Fill padding rows with zero
+    if (blockIdx.x >= m_size) {
+        const auto row = m_start + blockIdx.x;
+        const vec_t zeros = {};
+        for (uint32_t col = threadIdx.x; col < kNumVecsPerRow; col += kNumThreads) {
+            const auto off = static_cast<uint64_t>(row) * kNumVecsPerRow + col;
+            *(reinterpret_cast<vec_t*>(o2_bwd) + off) = zeros;
+            const auto off2 = static_cast<uint64_t>(row) * kNumVecsPerRow * 2 + col;
+            *(reinterpret_cast<vec_t*>(do1) + off2) = zeros;
+            *(reinterpret_cast<vec_t*>(do1) + off2 + kNumVecsPerRow) = zeros;
+        }
+        return;
+    }
+
+    const auto bwd_row = m_start + blockIdx.x;
+    const auto fwd_row = blockIdx.x < m_size ? smem_fwd_row : bwd_row;
+    const auto prob = probs[fwd_row];
+    float dprobs_sum = 0.0;
+
+    for (uint32_t col = threadIdx.x; col < kNumVecsPerRow; col += kNumThreads) {
+        const auto off = static_cast<uint64_t>(bwd_row) * kNumVecsPerRow + col;
+        const auto do2_vec = __ldg(reinterpret_cast<const vec_t*>(do2) + off);
+        vec_t lo_vec, hi_vec, o2_vec, d_lo_vec, d_hi_vec;
+
+        if constexpr (kInterleaved) {
+            const auto off = static_cast<uint64_t>(fwd_row) * kNumVecsPerRow + col;
+            lo_vec = __ldg(reinterpret_cast<const vec_t*>(o1) + off * 2);
+            hi_vec = __ldg(reinterpret_cast<const vec_t*>(o1) + off * 2 + 1);
+        } else {
+            const auto off = static_cast<uint64_t>(fwd_row) * kNumVecsPerRow * 2 + col;
+            lo_vec = __ldg(reinterpret_cast<const vec_t*>(o1) + off);
+            hi_vec = __ldg(reinterpret_cast<const vec_t*>(o1) + off + kNumVecsPerRow);
         }
 
-        const auto prob = probs[fwd_row];
+        const auto* grad = reinterpret_cast<const cutlass::bfloat16_t*>(&do2_vec);
+        const auto* lo = reinterpret_cast<const cutlass::bfloat16_t*>(&lo_vec);
+        const auto* hi = reinterpret_cast<const cutlass::bfloat16_t*>(&hi_vec);
+        auto* o2_out = reinterpret_cast<cutlass::bfloat16_t*>(&o2_vec);
+        auto* d_lo = reinterpret_cast<cutlass::bfloat16_t*>(&d_lo_vec);
+        auto* d_hi = reinterpret_cast<cutlass::bfloat16_t*>(&d_hi_vec);
 
         #pragma unroll
-        for (uint32_t step = 0; step < kSumStride; ++ step)
-            dprobs_sum[step] = 0.0f;
+        for (uint32_t i = 0; i < kNumElemsPerAccess; ++ i) {
+            const auto k = (i % kNumPairsPerVec) * 2;
+            const auto d = static_cast<float>(grad[i]);
+            float g, u;
+            if constexpr (kInterleaved) {
+                const auto* pair = i < kNumPairsPerVec ? lo : hi;
+                g = static_cast<float>(pair[k]);
+                u = static_cast<float>(pair[k + 1]);
+            } else {
+                g = static_cast<float>(lo[i]);
+                u = static_cast<float>(hi[i]);
+            }
 
-        // Iterate over kNumVecsPerRow, each thread handles kSumStride vecs per loop
-        for (uint32_t col = lane_idx; col < kNumVecsPerRow; col += 32 * kSumStride) {
+            const auto s = kPrecise ? 1.0f / (1.0f + expf(-g))
+                                    : __fdividef(1.0f, 1.0f + __expf(-g));
+            const auto silu = g * s;
+            const auto w = silu * u;
 
-            // no unroll
-            // NOTES: this kernel must stay free of any stack frame (`cuobjdump -res-usage` has
-            //        to report `STACK:0`), otherwise the launch itself is broken and reports an
-            //        invalid address (700). This may be a bug of the cubin JIT mechanism. Here
-            //        we omit the unroll pragma to avoid register spilling
-            for (uint32_t step = 0; step < kSumStride; ++ step) {
-                const auto idx = step * 32 + col;
-                if (idx >= kNumVecsPerRow)
-                    continue;
+            const auto dw = d * prob;
+            const auto du = dw * silu;
+            const auto dg = dw * u * s * (1.0f + g * (1.0f - s));
 
-                const auto off = static_cast<uint64_t>(bwd_row) * kNumVecsPerRow + idx;
-                const auto do2_vec = __ldg(reinterpret_cast<const vec_t*>(do2) + off);
-                vec_t lo_vec, hi_vec, o2_vec, d_lo_vec, d_hi_vec;
+            dprobs_sum += d * w;
 
-                if constexpr (kInterleaved) {
-                    const auto off = static_cast<uint64_t>(fwd_row) * kNumVecsPerRow + idx;
-                    lo_vec = __ldg(reinterpret_cast<const vec_t*>(o1) + off * 2);
-                    hi_vec = __ldg(reinterpret_cast<const vec_t*>(o1) + off * 2 + 1);
-                } else {
-                    const auto off = static_cast<uint64_t>(fwd_row) * kNumVecsPerRow * 2 + idx;
-                    lo_vec = __ldg(reinterpret_cast<const vec_t*>(o1) + off);
-                    hi_vec = __ldg(reinterpret_cast<const vec_t*>(o1) + off + kNumVecsPerRow);
-                }
+            o2_out[i] = static_cast<cutlass::bfloat16_t>(w * prob);
 
-                const auto* grad = reinterpret_cast<const cutlass::bfloat16_t*>(&do2_vec);
-                const auto* lo = reinterpret_cast<const cutlass::bfloat16_t*>(&lo_vec);
-                const auto* hi = reinterpret_cast<const cutlass::bfloat16_t*>(&hi_vec);
-                auto* o2_out = reinterpret_cast<cutlass::bfloat16_t*>(&o2_vec);
-                auto* d_lo = reinterpret_cast<cutlass::bfloat16_t*>(&d_lo_vec);
-                auto* d_hi = reinterpret_cast<cutlass::bfloat16_t*>(&d_hi_vec);
-
-                #pragma unroll
-                for (uint32_t i = 0; i < kNumElemsPerAccess; ++ i) {
-                    const auto k = (i % kNumPairsPerVec) * 2;
-                    const auto d = static_cast<float>(grad[i]);
-                    float g, u;
-                    if constexpr (kInterleaved) {
-                        const auto* pair = i < kNumPairsPerVec ? lo : hi;
-                        g = static_cast<float>(pair[k]);
-                        u = static_cast<float>(pair[k + 1]);
-                    } else {
-                        g = static_cast<float>(lo[i]);
-                        u = static_cast<float>(hi[i]);
-                    }
-
-                    const auto s = kPrecise ? 1.0f / (1.0f + expf(-g))
-                                            : __fdividef(1.0f, 1.0f + __expf(-g));
-                    const auto silu = g * s;
-                    const auto w = silu * u;
-
-                    const auto dw = d * prob;
-                    const auto du = dw * silu;
-                    const auto dg = dw * u * s * (1.0f + g * (1.0f - s));
-
-                    dprobs_sum[step] += d * w;
-
-                    o2_out[i] = static_cast<cutlass::bfloat16_t>(w * prob);
-
-                    if constexpr (kInterleaved) {
-                        auto* pair = i < kNumPairsPerVec ? d_lo : d_hi;
-                        pair[k] = static_cast<cutlass::bfloat16_t>(dg);
-                        pair[k + 1] = static_cast<cutlass::bfloat16_t>(du);
-                    } else {
-                        d_lo[i] = static_cast<cutlass::bfloat16_t>(dg);
-                        d_hi[i] = static_cast<cutlass::bfloat16_t>(du);
-                    }
-                }
-
-                *(reinterpret_cast<vec_t*>(o2_bwd) + off) = o2_vec;
-
-                if constexpr (kInterleaved) {
-                    *(reinterpret_cast<vec_t*>(do1) + off * 2) = d_lo_vec;
-                    *(reinterpret_cast<vec_t*>(do1) + off * 2 + 1) = d_hi_vec;
-                } else {
-                    const auto off = static_cast<uint64_t>(bwd_row) * kNumVecsPerRow * 2 + idx;
-                    *(reinterpret_cast<vec_t*>(do1) + off) = d_lo_vec;
-                    *(reinterpret_cast<vec_t*>(do1) + off + kNumVecsPerRow) = d_hi_vec;
-                }
+            if constexpr (kInterleaved) {
+                auto* pair = i < kNumPairsPerVec ? d_lo : d_hi;
+                pair[k] = static_cast<cutlass::bfloat16_t>(dg);
+                pair[k + 1] = static_cast<cutlass::bfloat16_t>(du);
+            } else {
+                d_lo[i] = static_cast<cutlass::bfloat16_t>(dg);
+                d_hi[i] = static_cast<cutlass::bfloat16_t>(du);
             }
         }
 
-        // Reduce dprobs. Strictly fold the back half to the front half
+        *(reinterpret_cast<vec_t*>(o2_bwd) + off) = o2_vec;
+
+        if constexpr (kInterleaved) {
+            *(reinterpret_cast<vec_t*>(do1) + off * 2) = d_lo_vec;
+            *(reinterpret_cast<vec_t*>(do1) + off * 2 + 1) = d_hi_vec;
+        } else {
+            const auto off = static_cast<uint64_t>(bwd_row) * kNumVecsPerRow * 2 + col;
+            *(reinterpret_cast<vec_t*>(do1) + off) = d_lo_vec;
+            *(reinterpret_cast<vec_t*>(do1) + off + kNumVecsPerRow) = d_hi_vec;
+        }
+    }
+
+    __shared__ float smem_dprobs_sum[kNumThreads];
+    smem_dprobs_sum[threadIdx.x] = dprobs_sum;
+    __syncthreads();
+
+    // Reduce dprobs in warp 0. Strictly fold the back half to the front half
+    if (warp_idx == 0) {
+        float reg_dprobs_sum[kNumThreads / 32];
         #pragma unroll
-        for (uint32_t stride = kSumStride / 2; stride > 0; stride /= 2) {
+        for (uint32_t i = 0; i < kNumThreads / 32; ++ i)
+            reg_dprobs_sum[i] = smem_dprobs_sum[i * 32 + lane_idx];
+
+        #pragma unroll
+        for (uint32_t stride = kNumThreads / 64; stride > 0; stride /= 2) {
             #pragma unroll
-            for (uint32_t i = 0; i < stride; ++ i) {
-                dprobs_sum[i] += dprobs_sum[i + stride];
-            }
+            for (uint32_t i = 0; i < stride; ++ i)
+                reg_dprobs_sum[i] += reg_dprobs_sum[i + stride];
         }
-        auto dprobs = dprobs_sum[0];
+
+        auto dprobs = reg_dprobs_sum[0];
         #pragma unroll
-        for (uint32_t stride = 16; stride > 0; stride /= 2) {
+        for (uint32_t stride = 16; stride > 0; stride /= 2)
             dprobs += __shfl_down_sync(0xffffffff, dprobs, stride);
-        }
         dprobs = __shfl_sync(0xffffffff, dprobs, 0);
+
         if (owns_slot)
             drecv_probs[slot] = dprobs;
     }

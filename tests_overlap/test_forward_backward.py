@@ -1,4 +1,5 @@
 import time
+import argparse
 import numpy as np
 from typing import NamedTuple
 
@@ -26,10 +27,10 @@ SEQLEN = 16384
 TOPK = 8
 
 CHUNK = 4096
-NUM_SMS = 96
+NUM_SMS = 100
 ALIGNMENT = 128
-FUSE_SWIGLU = False
-PRECISE_SWIGLU = True
+FUSED_SWIGLU = False
+PRECISE_SWIGLU = False
 INTERLEAVED = False
 
 
@@ -240,7 +241,7 @@ def compute_chunk(recv_x_pad, recv_probs, topk_indices, w_gateup, w_down, dout_p
 
     paddle.base.core.nvprof_nvtx_push("forward")
     for task_idx in range(len(task_queue)):
-        if FUSE_SWIGLU:
+        if FUSED_SWIGLU:
             deep_gemm.bf16_chunk_gemm_nn(x, w_gateup, o1, task_queue, task_idx, o2=o2, probs=probs)
         else:
             deep_gemm.bf16_chunk_gemm_nn(x, w_gateup, o1, task_queue, task_idx)
@@ -272,7 +273,7 @@ def compute_chunk(recv_x_pad, recv_probs, topk_indices, w_gateup, w_down, dout_p
         deep_gemm.bf16_chunk_gemm_nt(do3, w_down, do2, task_queue_bwd, task_idx)
         deep_gemm.chunk_weighted_swiglu_grad(
             o1, probs, do2, o2_bwd, do1, drecv_probs, atomic_to_zip_bwd, zip_to_atomic,
-            topk_indices, task_queue_bwd, task_idx, precise=PRECISE_SWIGLU,
+            topk_indices, task_queue_bwd, task_idx, CHUNK, precise=PRECISE_SWIGLU,
             interleaved=INTERLEAVED)
         deep_gemm.bf16_chunk_gemm_nt(do1, w_gateup, dx, task_queue_bwd, task_idx)
         deep_gemm.chunk_zip(dx, drecv_x, atomic_to_zip_bwd, zip_to_atomic_bwd, topk_indices,
@@ -362,4 +363,17 @@ def main():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fused-swiglu", action="store_true",
+                        help="Use fused swiglu in gateup_proj epilogue")
+    parser.add_argument("--precise-swiglu", action="store_true",
+                        help="Use precise swiglu, only applies for unfused swiglu")
+    parser.add_argument("--interleaved", action="store_true",
+                        help="Use fully-interleaved w_gateup, only applies for unfused swiglu")
+    args = parser.parse_args()
+
+    FUSED_SWIGLU = args.fused_swiglu
+    PRECISE_SWIGLU = args.precise_swiglu
+    INTERLEAVED = args.interleaved
+
     main()

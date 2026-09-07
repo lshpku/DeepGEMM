@@ -16,7 +16,7 @@ public:
     struct Args {
         LaunchArgs launch_args;
 
-        int num_sms, num_threads, num_topk;
+        int num_threads, num_topk;
         int num_vecs_per_row, num_elems_per_access;
         bool precise, interleaved;
         void* task_queue;
@@ -41,12 +41,12 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&smxx_chunk_weighted_swiglu_grad_impl<
-        {}, {}, {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}
     >);
 }};
 )",
-        args.num_sms, args.num_threads, args.num_topk, args.num_vecs_per_row,
-        args.num_elems_per_access, args.precise, args.interleaved);
+        args.num_threads, args.num_topk, args.num_vecs_per_row, args.num_elems_per_access,
+        args.precise, args.interleaved);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -71,19 +71,19 @@ static void smxx_chunk_weighted_swiglu_grad(const torch::Tensor& o1,
                                             const torch::Tensor& recv_token_indices,
                                             const torch::Tensor& task_queue,
                                             const int& task_idx,
+                                            const int& chunk_size,
                                             const bool& precise,
                                             const bool& interleaved) {
     constexpr int kNumElemsPerAccess = 8;
 
-    const auto num_sms = device_runtime->get_num_sms();
-    const auto num_threads = precise ? 512 : 1024;
+    const auto num_blocks = chunk_size;
+    const auto num_threads = 256;  // align to paddle reduce stride
     const auto shape_n = static_cast<int>(do2.size(-1));
     DG_HOST_ASSERT(shape_n % kNumElemsPerAccess == 0);
     const auto num_vecs_per_row = shape_n / kNumElemsPerAccess;
 
     const SMXXChunkWeightedSwigluGradRuntime::Args args = {
-        .launch_args = LaunchArgs(num_sms, num_threads),
-        .num_sms = num_sms,
+        .launch_args = LaunchArgs(num_blocks, num_threads),
         .num_threads = num_threads,
         .num_topk = static_cast<int>(zip_to_atomic.size(-1)),
         .num_vecs_per_row = num_vecs_per_row,
