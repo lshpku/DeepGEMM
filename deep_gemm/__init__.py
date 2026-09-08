@@ -65,6 +65,10 @@ try:
         chunk_signal_token_done,
         chunk_zip,
         num_chunk_task_fields,
+        # Offline order conversion helpers
+        sort_unzip_map,
+        sort_atomic_map,
+        token_gather,
         # Einsum kernels
         einsum,
         fp8_einsum,

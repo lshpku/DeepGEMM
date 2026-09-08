@@ -8,6 +8,8 @@
 #include "../jit_kernels/impls/smxx_chunk_weighted_swiglu.hpp"
 #include "../jit_kernels/impls/smxx_chunk_weighted_swiglu_grad.hpp"
 #include "../jit_kernels/impls/smxx_chunk_zip.hpp"
+#include "../jit_kernels/impls/smxx_sort_map.hpp"
+#include "../jit_kernels/impls/smxx_token_gather.hpp"
 #endif
 
 namespace deep_gemm::overlap {
@@ -270,6 +272,61 @@ static void chunk_zip(const torch::Tensor& o3, const torch::Tensor& combine_inpu
                    num_valid_topk, token_done, zip_done, task_queue, task_idx, chunk_size);
 }
 
+// Shared checks of the two offline order maps, both of which only scan one `zip_to_atomic`
+// NOTES: these run after the whole dispatch, so there is no consistency logic at all
+static torch::Tensor sort_map(const torch::Tensor& zip_to_atomic,
+                              const torch::Tensor& m_start,
+                              const int& num_unzipped_tokens,
+                              const bool& output_atomic) {
+    // `zip_to_atomic` uses the DeepEP order, matching `recv_token_indices` slot by slot
+    const auto [num_recv_tokens, num_topk] = get_shape<2>(zip_to_atomic);
+    DG_HOST_ASSERT(num_recv_tokens > 0 and num_topk > 0);
+    DG_HOST_ASSERT(zip_to_atomic.is_contiguous() and zip_to_atomic.scalar_type() == torch::kInt);
+
+    // `m_start` holds the row offset of every expert's region plus `num_unzipped_tokens`,
+    // which is all this needs to tell the experts apart and to fill their padded tails
+    DG_HOST_ASSERT(m_start.is_contiguous() and m_start.dim() == 1);
+    DG_HOST_ASSERT(m_start.numel() >= 2 and m_start.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(num_unzipped_tokens > 0);
+
+    const auto out = torch::empty({num_unzipped_tokens}, zip_to_atomic.options());
+    smxx_sort_map(zip_to_atomic, m_start, out, output_atomic);
+    return out;
+}
+
+// The standard unzip order of the forward, i.e. what Paddle's `unzip` would produce
+// NOTES: the returned `ordered_to_zip` has the shape of `atomic_to_zip`, but each expert's
+//        region is sorted by the token's index in the DeepEP order, so one `token_gather` from
+//        the un-unzipped `recv_x` gives the reference `unzipped_tokens`; padding rows hold `-1`
+static torch::Tensor sort_unzip_map(const torch::Tensor& zip_to_atomic,
+                                    const torch::Tensor& m_start,
+                                    const int& num_unzipped_tokens) {
+    return sort_map(zip_to_atomic, m_start, num_unzipped_tokens, false);
+}
+
+// The standard unzip order to the atomic order of the same pass
+// NOTES: the returned `ordered_to_atomic` maps a reference row to its atomic row, so one
+//        `token_gather` brings any atomic-order buffer into the reference order; padding `-1`
+static torch::Tensor sort_atomic_map(const torch::Tensor& zip_to_atomic,
+                                     const torch::Tensor& m_start,
+                                     const int& num_unzipped_tokens) {
+    return sort_map(zip_to_atomic, m_start, num_unzipped_tokens, true);
+}
+
+// `paddle.gather(x, index, axis=0)` with `-1` gathering a zeroed row instead of the last one
+// NOTES: the rows are copied as 16B vectors, so `x` must be vector aligned in both its base
+//        pointer and its row length, which any real token buffer is
+static torch::Tensor token_gather(const torch::Tensor& x, const torch::Tensor& index) {
+    const auto [num_rows, row_size] = get_shape<2>(x);
+    DG_HOST_ASSERT(num_rows > 0 and row_size > 0 and x.is_contiguous());
+    DG_HOST_ASSERT(index.is_contiguous() and index.dim() == 1);
+    DG_HOST_ASSERT(index.numel() > 0 and index.scalar_type() == torch::kInt);
+
+    const auto out = torch::empty({static_cast<int>(index.numel()), row_size}, x.options());
+    smxx_token_gather(x, index, out, row_size * static_cast<int>(x.element_size()));
+    return out;
+}
+
 #endif
 
 static void register_apis(pybind11::module_& m) {
@@ -305,6 +362,12 @@ static void register_apis(pybind11::module_& m) {
           py::arg("token_done"), py::arg("zip_done"),
           py::arg("task_queue"), py::arg("task_idx"), py::arg("chunk_size"));
     m.attr("num_chunk_task_fields") = static_cast<int>(kNumChunkTaskFields);
+    m.def("sort_unzip_map", &sort_unzip_map,
+          py::arg("zip_to_atomic"), py::arg("m_start"), py::arg("num_unzipped_tokens"));
+    m.def("sort_atomic_map", &sort_atomic_map,
+          py::arg("zip_to_atomic"), py::arg("m_start"), py::arg("num_unzipped_tokens"));
+    m.def("token_gather", &token_gather,
+          py::arg("x"), py::arg("index"));
 #endif
 }
 

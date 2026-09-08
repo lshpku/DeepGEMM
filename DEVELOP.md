@@ -25,6 +25,7 @@ python tests_overlap/test_chunk.py --arrival cpu
 python tests_overlap/test_chunk.py --check-signal
 python tests_overlap/test_fused_swiglu.py
 python tests_overlap/test_zip.py
+python tests_overlap/test_sort_map.py
 ```
 
 `test_gemm_baseline.py`：对比group_gemm和chunk的性能测试，一个是调用单次group_gemm，一个是分chunk调用，实测性能差距很小，chunk方案仅慢2%，说明分chunk几乎不影响性能
@@ -34,6 +35,8 @@ python tests_overlap/test_zip.py
 `test_fused_swiglu.py`：单算子测试，验证把 weighted SwiGLU 融进 gateup epilogue 的正确性（o1/o2 都与两 kernel 路径逐位一致）和代价（融合只多 2us，独立 swiglu kernel 要 26us）
 
 `test_zip.py`：融合 zip 算子（done+zip）的正确性测试。按真实路由构造 4096 个不重复 token、topk=8、专家区域向 128 对齐的 o3（atomic 序，行内乱序），用乱序 task_queue 逐 chunk 调 `chunk_zip`，与 `paddle.nn.functional.moe_unpermute` 逐位比对 `combine_input`，并检查 `zip_done` 全 1、`token_done` 恰好等于 `num_valid_topk`。三组 `(num_sms, chunk)` 配置覆盖每专家单 chunk、多 chunk + 余数 chunk、以及 CTA 本地队列被压满的情况，三种不同的到达顺序给出逐位相同的结果，即验证了确定性
+
+`test_sort_map.py`：离线顺序转换函数（`sort_unzip_map` / `sort_atomic_map` / `token_gather`）的正确性测试。按真实路由构造两份不同的 atomic 序（前向/反向），与 python 侧的 sort/argsort 参考逐位比对两张映射表，并用 `token_gather` 验证解压（recv_x → 标准序）、重排（atomic 序 → 标准序）和两者串联的结果，附带一组 fp32 + 非幂次行长的输入
 
 
 ## 开发进展
@@ -132,5 +135,14 @@ python tests_overlap/test_zip.py
 * 测试侧：`interleave_gateup` / `interleave_columns` 换成完全交错，`split_gate_up` 按 `[m, I, 2]` 拆；`test_chunk.py` 新增 `--no-fuse` 跑独立 swiglu 那条路
 * 顺手修了个测试 bug：`valid_rows = atomic_to_zip.nonzero()` 把 padding 行（值 -1）也当成有效行，同时漏掉了 token 0 那行；改成 `(atomic_to_zip >= 0).nonzero()`。之前只跑融合路径所以没暴露——融合 epilogue 对 padding 行照算，和 reference 一致；独立 swiglu 会把 padding 尾巴补零，于是 o2/o3 的 padding 行对不上（diff 4e-3，正好是 1124/136448 行的能量占比）
 * 坑：JIT 的 cache key 只哈希生成的那段 wrapper 代码（`name$$compiler$$flags$$code`），不包含 `.cuh` 的内容，改 header 后如果模板参数不变就会命中旧 cubin；调这类改动记得 `rm -rf ~/.deep_gemm/cache`
+
+
+9.8: 新增三个离线顺序转换函数，用来替掉压测里的 sort/argsort 和 paddle 的 gather
+* `sort_unzip_map(zip_to_atomic, m_start, num_unzipped_tokens) -> ordered_to_zip`、`sort_atomic_map(...) -> ordered_to_atomic`，两者是同一个 kernel 的两个实例化（`kOutputAtomic`），只是一行存 token 下标还是存 atomic 行号
+* 不需要 `recv_token_indices`：一个槽位属于哪个专家可以直接由 `m_start[e] <= zip_to_atomic[slot] < m_start[e+1]` 判断，因为每个专家在 unzip buffer 里占一段互不相交且从头填满的区域，顺带省掉了 int64 表的访存
+* 一个 CTA 负责一个专家，按 DeepEP 序整表扫一遍，token 在专家内的 rank 就是它前面同专家 token 的个数，即一个 prefix sum（warp 内 `__ballot_sync`+`popc`，warp 间走 smem，CTA 间不需要通信所以没有多 kernel 的 scan）；扫完后由本 CTA 把该专家的 padding 尾巴填 -1
+* 两个函数都要求 `m_start` 是 `[num_experts+1]` 的 int32 显存 tensor（最后一项为 `num_unzipped_tokens`），实际训练里 dispatch 前就知道 `tokens_per_expert`，host 侧现算即可
+* `token_gather(x, index) -> out`：按 16B 向量搬行，`-1` 的下标写全 0（paddle 的 gather 会理解成最后一行，之前测试里得靠给 `recv_x` 多 padding 一行全 0 来绕），host 侧 assert 指针和行长都是 16B 对齐，行长作模板参数所以行/列拆分是移位
+* `test_sort_map.py` 全部 diff 0；`cuobjdump -res-usage` 三个实例化都是 REG≤32、STACK/LOCAL 全 0
 
 

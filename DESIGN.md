@@ -146,3 +146,22 @@ drecv_probs 是一个和 recv_token_indices 相同 shape 和 token 槽位的 ten
 注：DeepEP 用的是前反完全对称的实现（或者说它就没有反向的概念），combine 的反向就是一模一样的 dispatch，它在给我们反向 atomic 序的 do3（也就是 unzipped_tokens）的同时也会给出反向 atomic 序的 atomic_to_zip/zip_to_atomic；但是 recv_token_indices 是前反向相同的，包括 token 槽位也相同
 
 反向 atomic 序到前向 atomic 序转换的一种做法为：通过反向 atomic_to_zip 拿到一个 token 在 DeepEP 序中的位置 -> 通过 recv_token_indices 获取该 token 所属专家的槽位 -> 在前向 zip_to_atomic 的对应槽位中拿到该 token 在前向 atomic 序中的下标
+
+
+### 离线顺序转换函数
+
+需要一些顺序转换函数来高效压测正确性，用 sort 固然可以，但是非常影响大规模训练下的压测效率
+以下函数都是离线函数，在通信全部结束后才进行，不需要处理任何一致性逻辑
+
+`sort_unzip_map`
+* 输入：前向的 zip_to_atomic 等变量
+* 输出：
+  * ordered_to_zip [num_unzipped_tokens] int32 : 和前向 atomic_to_zip 的 shape 一样，但是每个专家内的 token 是按照它们在 DeepEP 序中的顺序排序的，对应 paddle 标准的 unzip 的行为，这样用户就可以通过一次 gather 从前向未 unzip 的 recv_x [num_recv_tokens, hidden] 中解压出 paddle 标准顺序的 unzipped_tokens；padding 位填 -1
+
+`sort_atomic_map`
+* 输入：反向的 zip_to_atomic 等变量
+* 输出：
+  * ordered_to_atomic [num_unzipped_tokens] int32 : 将标准 unzip 序映射到反向 atomic 序的映射表，这样用户可以通过一次 gather 从反向 atomic 序的 do1/o2_bwd/do3 得到 paddle 标准顺序的 do1/o2_bwd/do3；padding 位填 -1
+
+`token_gather`
+* 类似 paddle.gather(x, index, axis=0)，但是对于 -1 的下标直接写 0（paddle 对于 -1 下标是理解为 len(x)-1，这不符合 padding 的要求）

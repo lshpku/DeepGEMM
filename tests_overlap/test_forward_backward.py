@@ -15,6 +15,8 @@ paddle.seed(0)
 import deep_gemm
 print("deep_gemm:", deep_gemm.__path__)
 
+from utils import make_deepep_layout, make_atomic_layout
+
 # 使用特别编译的注释掉 deep_gemm 的版本, 不然会和我们的头文件冲突
 import paddlefleet_ops
 assert not paddlefleet_ops._DEEP_GEMM_AVAILABLE
@@ -49,65 +51,6 @@ class Result(NamedTuple):
 
     def __getitem__(self, key: str):
         return getattr(self, key)
-
-
-def make_deepep_layout():
-    """
-    模拟在一个 EP 组内, 每个 rank 有 E 个专家的情况下, rank 0 收到的 dispatch+unzip 后的
-    (recv_token_indices, tokens_per_expert).
-    """
-    # 模拟全局 token 打分
-    scores = paddle.randn([EP * SEQLEN, EP * E])
-    scores += paddle.randn([EP * E]) * 0.1  # add some system bias to experts
-    _, topk_indices = scores.topk(TOPK)
-
-    # 只保留命中 rank0 的 token, 故 topk_indices 里每一行至少有一个非 -1 值
-    topk_hit = topk_indices < E
-    token_hit = topk_hit.any(axis=1).nonzero().squeeze(1)
-    topk_indices[~topk_hit] = -1
-    topk_indices = topk_indices[token_hit]
-
-    # DeepEP 并未对每行内容进行排序, 甚至有效值和 -1 是交错排列的, 这里对每行进行乱序
-    row_perm = paddle.randn(topk_indices.shape).argsort(axis=1)
-    topk_indices = topk_indices.index_sample(row_perm)
-
-    tokens_per_expert = paddle.sum(
-        paddle.arange(E)[:, None] == topk_indices.flatten(), axis=1).tolist()
-
-    m_start, m_indices = [0], []
-
-    for expert_idx, n in enumerate(tokens_per_expert):
-        n_aligned = (n + ALIGNMENT - 1) // ALIGNMENT * ALIGNMENT
-        m_start.append(m_start[-1] + n_aligned)
-        m_indices.append(paddle.full([n_aligned], expert_idx, dtype="int32"))
-
-    m_indices = paddle.concat(m_indices)
-
-    return topk_indices, tokens_per_expert, m_start, m_indices
-
-
-def make_atomic_layout(topk_indices, tokens_per_expert, m_start):
-    """
-    根据 DeepEP 序构造一份随机顺序的 atomic 序.
-    DeepEP 序前反向是相同的, 但是 atomic 序不同, 可以调用两次本函数模拟不同的 atomic 序.
-    """
-    atomic_to_zip = paddle.full([m_start[-1]], -1, dtype="int32")
-    zip_to_atomic = paddle.full(topk_indices.shape, -1, dtype="int32")
-
-    for expert_idx, (n, offset) in enumerate(zip(tokens_per_expert, m_start)):
-        # 选出属于 expert_idx 的 token 并打乱顺序
-        slot_hit = topk_indices == expert_idx 
-        token_idxs = slot_hit.any(axis=1).nonzero().squeeze(1).cast("int32")
-        assert len(token_idxs) == n
-        perm = paddle.randperm(n)
-
-        atomic_to_zip[offset : offset + n] = token_idxs[perm]
-
-        zip_to_atomic[slot_hit] = paddle.empty([n], dtype="int32").scatter_(
-            perm, paddle.arange(n, dtype="int32") + offset
-        )
-
-    return atomic_to_zip, zip_to_atomic
 
 
 def make_task_queue(counts, m_start, ready, seed=0):
@@ -216,15 +159,15 @@ def reference(recv_x, recv_probs, topk_indices, tokens_per_expert, m_indices, w_
     return Result(x, o1, o2, o3, out, do2, do1, dx, drecv_x, drecv_probs)
 
 
-def compute_chunk(recv_x_pad, recv_probs, topk_indices, w_gateup, w_down, dout_pad,
+def compute_chunk(recv_x, recv_probs, topk_indices, w_gateup, w_down, dout,
                   atomic_to_zip, zip_to_atomic, atomic_to_zip_bwd, zip_to_atomic_bwd,
                   task_queue, task_queue_bwd):
     num_valid_topk = (topk_indices != -1).sum(axis=-1, dtype="int32")
 
     ################################# Forward ##################################
 
-    # paddle gather 会将 -1 的下标映射到最后一行, 故 padding token 会得到全 0
-    x = recv_x_pad[atomic_to_zip]
+    # 模拟通信已经给出 unzip 的结果
+    x = deep_gemm.token_gather(recv_x, atomic_to_zip)
 
     # paddle scatter 会将 -1 的下标映射到最后一格, 需要多分配一格来接住这些无效值
     probs_pad = paddle.zeros([len(x) + 1], dtype="float32")
@@ -254,8 +197,7 @@ def compute_chunk(recv_x_pad, recv_probs, topk_indices, w_gateup, w_down, dout_p
 
     ################################# Backward #################################
 
-    x = recv_x_pad[atomic_to_zip_bwd]
-    do3 = dout_pad[atomic_to_zip_bwd]
+    do3 = deep_gemm.token_gather(dout, atomic_to_zip_bwd)
 
     dx = paddle.full_like(x, float("nan"))
     do1 = paddle.full_like(o1, float("nan"))
@@ -304,15 +246,11 @@ def check(x, y):
 def main():
     deep_gemm.set_num_sms(NUM_SMS)
 
-    topk_indices, tokens_per_expert, m_start, m_indices = make_deepep_layout()
+    topk_indices, tokens_per_expert, m_start, m_indices = make_deepep_layout(
+        EP, SEQLEN, E, TOPK, ALIGNMENT)
 
-    # 给最后 padding 一行全 0, 方便 gather 的时候将 -1 的下标映射到全 0
-    recv_x_pad = paddle.randn([len(topk_indices) + 1, H], dtype="bfloat16")
-    recv_x_pad[-1].zero_()
-    recv_x = recv_x_pad[:-1]
-    dout_pad = paddle.randn_like(recv_x_pad)
-    dout_pad[-1].zero_()
-    dout = dout_pad[:-1]
+    recv_x = paddle.randn([len(topk_indices), H], dtype="bfloat16")
+    dout = paddle.randn_like(recv_x)
 
     recv_probs = paddle.randn(topk_indices.shape)
     w_gateup = paddle.randn([E, H, 2 * I], dtype="bfloat16") * 0.02
@@ -334,7 +272,7 @@ def main():
     task_queue_bwd = make_task_queue(tokens_per_expert, m_start, ready=True, seed=1)
 
     paddle.base.core.nvprof_start()
-    outs = compute_chunk(recv_x_pad, recv_probs, topk_indices, w_gateup, w_down, dout_pad,
+    outs = compute_chunk(recv_x, recv_probs, topk_indices, w_gateup, w_down, dout,
                          atomic_to_zip, zip_to_atomic, atomic_to_zip_bwd, zip_to_atomic_bwd,
                          task_queue, task_queue_bwd)
     paddle.base.core.nvprof_stop()
@@ -345,9 +283,9 @@ def main():
     bwd_perm = get_atomic_perm(tokens_per_expert, m_start, atomic_to_zip_bwd)
 
     checks = [
-        (("o1", "o2", "o3"), fwd_perm),
+        (("x", "o1", "o2", "o3"), fwd_perm),
         (("out",), None),
-        (("x", "do2", "do1", "dx"), bwd_perm),
+        (("do2", "do1", "dx"), bwd_perm),
         (("drecv_x", "drecv_probs"), None),
     ]
 
