@@ -50,7 +50,7 @@ static void smxx_sort_map(const torch::Tensor& zip_to_atomic,
                           const torch::Tensor& m_start,
                           const torch::Tensor& out,
                           const bool& output_atomic) {
-    constexpr int kNumThreads = 256;
+    constexpr int kNumThreads = 1024;
 
     const auto num_experts = static_cast<int>(m_start.numel()) - 1;
     const SMXXSortMapRuntime::Args args = {
