@@ -31,7 +31,6 @@ TOPK = 8
 CHUNK = 4096
 NUM_SMS = 100
 ALIGNMENT = 128
-FUSED_SWIGLU = False
 PRECISE_SWIGLU = False
 INTERLEAVED = False
 
@@ -184,12 +183,9 @@ def compute_chunk(recv_x, recv_probs, topk_indices, w_gateup, w_down, dout,
 
     paddle.base.core.nvprof_nvtx_push("forward")
     for task_idx in range(len(task_queue)):
-        if FUSED_SWIGLU:
-            deep_gemm.bf16_chunk_gemm_nn(x, w_gateup, o1, task_queue, task_idx, o2=o2, probs=probs)
-        else:
-            deep_gemm.bf16_chunk_gemm_nn(x, w_gateup, o1, task_queue, task_idx)
-            deep_gemm.chunk_weighted_swiglu(o1, probs, o2, task_queue, task_idx,
-                                            precise=PRECISE_SWIGLU, interleaved=INTERLEAVED)
+        deep_gemm.bf16_chunk_gemm_nn(x, w_gateup, o1, task_queue, task_idx)
+        deep_gemm.chunk_weighted_swiglu(o1, probs, o2, task_queue, task_idx,
+                                        precise=PRECISE_SWIGLU, interleaved=INTERLEAVED)
         deep_gemm.bf16_chunk_gemm_nn(o2, w_down, o3, task_queue, task_idx)
         deep_gemm.chunk_zip(o3, out, atomic_to_zip, zip_to_atomic, topk_indices, num_valid_topk,
                             token_done, zip_done, task_queue, task_idx, CHUNK)
@@ -302,15 +298,12 @@ def main():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--fused-swiglu", action="store_true",
-                        help="Use fused swiglu in gateup_proj epilogue")
     parser.add_argument("--precise-swiglu", action="store_true",
                         help="Use precise swiglu, only applies for unfused swiglu")
     parser.add_argument("--interleaved", action="store_true",
                         help="Use fully-interleaved w_gateup, only applies for unfused swiglu")
     args = parser.parse_args()
 
-    FUSED_SWIGLU = args.fused_swiglu
     PRECISE_SWIGLU = args.precise_swiglu
     INTERLEAVED = args.interleaved
 

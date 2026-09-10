@@ -18,7 +18,6 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N,
           GemmType kGemmType, bool kWithAccumulation,
           typename cd_dtype_t,
           typename epilogue_type_t,
-          bool kWithFusedSwiGLU,
           typename pattern_cd_t>
 CUTLASS_DEVICE void
 sm100_store_cd_swap_ab(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint32_t& tma_stage_idx,
@@ -27,10 +26,7 @@ sm100_store_cd_swap_ab(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint3
                        const uint32_t& effective_m,
                        const uint32_t& epilogue_warp_idx, const uint32_t& lane_idx,
                        const cutlass::arch::ClusterTransactionBarrier* tmem_empty_barrier,
-                       const cute::TmaDescriptor& tensor_map_cd,
-                       const float* fused_probs = nullptr,
-                       cutlass::bfloat16_t* fused_o2 = nullptr,
-                       const uint32_t& fused_ld_o2 = 0) {
+                       const cute::TmaDescriptor& tensor_map_cd) {
     // NOTES: The epilogue requires a full warpgroup to read all 128 TMEM rows,
     //          implying STORE_BLOCK_N must be 128.
     DG_STATIC_ASSERT(STORE_BLOCK_N == 128, "STORE_BLOCK_N must be 128 to match TMEM rows");
@@ -50,34 +46,9 @@ sm100_store_cd_swap_ab(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint3
         tma_stage_idx = (tma_stage_idx + 1) % kNumTMAStoreStages;
     };
 
-    // Fused SwiGLU: the gate/up pair of one channel is adjacent in the fully interleaved
-    // layout, so a 16B group holds `kNumFusedElems / 2` finished channels; one thread takes
-    // two adjacent groups to keep the output store 16B wide, which makes the whole
-    // `[STORE_BLOCK_M, STORE_BLOCK_N]` staged tile the `[STORE_BLOCK_M, 64]` output tile
-    // NOTES: the indices do not depend on the store stage
-    constexpr uint32_t kNumFusedElems = kNumBankGroupBytes / sizeof(cutlass::bfloat16_t);
-    constexpr uint32_t kNumAtomColGroups = STORE_BLOCK_N_ATOM / kNumFusedElems;
-    constexpr uint32_t kNumFusedColPairs = STORE_BLOCK_N / (kNumFusedElems * 2);
-    const auto fused_thread_idx = epilogue_warp_idx * 32 + lane_idx;
-    const auto fused_token = fused_thread_idx / kNumFusedColPairs;
-    const auto fused_col_pair = fused_thread_idx % kNumFusedColPairs;
-    // A pair never straddles two swizzle atoms, as an atom holds an even number of groups
-    const auto fused_col_group = fused_col_pair * 2;
-    const auto fused_atom_off = (fused_col_group / kNumAtomColGroups) * (STORE_BLOCK_M * kSwizzleCDMode);
-    const auto fused_atom_group = fused_col_group % kNumAtomColGroups;
-    const auto fused_smem_off = fused_atom_off + fused_token * kSwizzleCDMode +
-                                (fused_atom_group ^ (fused_token % 8)) * kNumBankGroupBytes;
-    const auto fused_smem_off_hi = fused_atom_off + fused_token * kSwizzleCDMode +
-                                   ((fused_atom_group + 1) ^ (fused_token % 8)) * kNumBankGroupBytes;
-
     // Iterate over M blocks
     const auto num_stores = effective_m / STORE_BLOCK_M;
     for (uint32_t s = 0; s < num_stores; ++ s, advance_store_pipeline()) {
-        // Prefetch the router score, so that its latency hides behind the UMMA wait and the STSM
-        float fused_prob = 0.0f;
-        if constexpr (kWithFusedSwiGLU)
-            fused_prob = __ldg(fused_probs + base_m_idx + s * STORE_BLOCK_M + fused_token);
-
         // Wait shared memory to be released
         if (epilogue_warp_idx == 0)
             cute::tma_store_wait<kNumTMAStoreStages - 1>();
@@ -167,39 +138,6 @@ sm100_store_cd_swap_ab(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint3
             cute::tma_store_arrive();
         }
         __syncwarp();
-
-        // Fused SwiGLU: with the fully interleaved weights, a channel's gate and up columns are
-        // neighbours in the staged tile, so the activation can be finished here instead of by a
-        // second pass over `o1`
-        // NOTES: reading the tile is safe until the next iteration's named barrier, which is
-        //        what gates the next STSM into it
-        if constexpr (kWithFusedSwiGLU) {
-            DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Fused SwiGLU requires BF16 C/D");
-            DG_STATIC_ASSERT(STORE_BLOCK_N == 128, "Fused SwiGLU requires a 2-atom store block");
-            DG_STATIC_ASSERT(kNumAtomColGroups % 2 == 0, "A column pair must stay inside one atom");
-            DG_STATIC_ASSERT(STORE_BLOCK_M * kNumFusedColPairs == kNumUMMAStoreThreads, "Invalid fused tile");
-
-            const auto* tile_ptr = reinterpret_cast<const uint8_t*>(smem_cd[tma_stage_idx]);
-            const auto lo_vec = *reinterpret_cast<const int4*>(tile_ptr + fused_smem_off);
-            const auto hi_vec = *reinterpret_cast<const int4*>(tile_ptr + fused_smem_off_hi);
-
-            const auto* lo = reinterpret_cast<const cutlass::bfloat16_t*>(&lo_vec);
-            const auto* hi = reinterpret_cast<const cutlass::bfloat16_t*>(&hi_vec);
-            cutlass::bfloat16_t out[kNumFusedElems];
-            #pragma unroll
-            for (uint32_t i = 0; i < kNumFusedElems; ++ i) {
-                const auto* pair = i < kNumFusedElems / 2 ? lo : hi;
-                const auto j = (i % (kNumFusedElems / 2)) * 2;
-                const auto g = static_cast<float>(pair[j]);
-                out[i] = static_cast<cutlass::bfloat16_t>(
-                    __fdividef(g, 1.0f + __expf(-g)) * static_cast<float>(pair[j + 1]) * fused_prob);
-            }
-
-            // Two interleaved columns make one activation channel
-            auto* out_ptr = fused_o2 + static_cast<uint64_t>(base_m_idx + s * STORE_BLOCK_M + fused_token) * fused_ld_o2 +
-                            base_n_idx / 2 + fused_col_pair * kNumFusedElems;
-            *reinterpret_cast<int4*>(out_ptr) = *reinterpret_cast<const int4*>(out);
-        }
     }
 }
 

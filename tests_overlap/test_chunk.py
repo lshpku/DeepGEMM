@@ -31,7 +31,6 @@ TOPK = 8
 CHUNK = 4096
 NUM_SMS = 96
 ALIGNMENT = 128
-FUSE_SWIGLU = True  # fuse the SwiGLU into the gate-up epilogue instead of a second kernel
 
 
 def parse_args():
@@ -201,11 +200,8 @@ def compute_chunk(task_idx, buffers, task_queue):
     """The (gateup, swiglu, down, signal) group of one chunk, all claiming the same task."""
     (x, w_gateup, w_down, probs, o1, o2, o3,
      atomic_to_zip, num_valid_topk, token_done, zip_task_queue, zip_queue_tail) = buffers
-    if FUSE_SWIGLU:
-        deep_gemm.bf16_chunk_gemm_nn(x, w_gateup, o1, task_queue, task_idx, o2=o2, probs=probs)
-    else:
-        deep_gemm.bf16_chunk_gemm_nn(x, w_gateup, o1, task_queue, task_idx)
-        deep_gemm.chunk_weighted_swiglu(o1, probs, o2, task_queue, task_idx, precise=True)
+    deep_gemm.bf16_chunk_gemm_nn(x, w_gateup, o1, task_queue, task_idx)
+    deep_gemm.chunk_weighted_swiglu(o1, probs, o2, task_queue, task_idx, precise=True)
     deep_gemm.bf16_chunk_gemm_nn(o2, w_down, o3, task_queue, task_idx)
     deep_gemm.chunk_signal_token_done(atomic_to_zip, num_valid_topk, token_done,
                                       zip_task_queue, zip_queue_tail, task_queue, task_idx)
@@ -230,7 +226,7 @@ def main():
     m_total = len(atomic_to_zip)
     num_valid_topk = paddle.sum(topk_indices >= 0, axis=1).astype("int32")
     print("arrival:", args.arrival, "| interval:", args.interval_ms,
-          "ms | check_signal:", args.check_signal, "| fuse_swiglu:", FUSE_SWIGLU)
+          "ms | check_signal:", args.check_signal)
     print("num_recv_tokens:", num_recv_tokens)
     print("tokens_per_expert:", tokens_per_expert)
     print("num_unzipped_tokens:", m_total, "seq_len:", SEQLEN, "topk:", TOPK)

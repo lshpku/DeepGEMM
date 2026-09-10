@@ -23,7 +23,6 @@ python tests_overlap/test_gemm_baseline.py
 python tests_overlap/test_chunk.py --arrival ready
 python tests_overlap/test_chunk.py --arrival cpu
 python tests_overlap/test_chunk.py --check-signal
-python tests_overlap/test_fused_swiglu.py
 python tests_overlap/test_zip.py
 python tests_overlap/test_sort_map.py
 ```
@@ -31,8 +30,6 @@ python tests_overlap/test_sort_map.py
 `test_gemm_baseline.py`：对比group_gemm和chunk的性能测试，一个是调用单次group_gemm，一个是分chunk调用，实测性能差距很小，chunk方案仅慢2%，说明分chunk几乎不影响性能
 
 `test_chunk.py`：chunk 流式全链路（gateup, swiglu, down, signal）的正确性测试。按真实路由构造布局（默认 16384 个不重复 token，topk=8，每专家区域向 128 对齐，所以有真的 padding 行），先在异步流上把全部 kernel 发出去让它们卡在 spin-wait 上，最后与 group_gemm 逐位比对 o1/o2/o3（只比真实行）并检查 `token_done` 每个 token 恰好被记 topk 次。
-
-`test_fused_swiglu.py`：单算子测试，验证把 weighted SwiGLU 融进 gateup epilogue 的正确性（o1/o2 都与两 kernel 路径逐位一致）和代价（融合只多 2us，独立 swiglu kernel 要 26us）
 
 `test_zip.py`：融合 zip 算子（done+zip）的正确性测试。按真实路由构造 4096 个不重复 token、topk=8、专家区域向 128 对齐的 o3（atomic 序，行内乱序），用乱序 task_queue 逐 chunk 调 `chunk_zip`，与 `paddle.nn.functional.moe_unpermute` 逐位比对 `combine_input`，并检查 `zip_done` 全 1、`token_done` 恰好等于 `num_valid_topk`。三组 `(num_sms, chunk)` 配置覆盖每专家单 chunk、多 chunk + 余数 chunk、以及 CTA 本地队列被压满的情况，三种不同的到达顺序给出逐位相同的结果，即验证了确定性
 
@@ -146,3 +143,5 @@ python tests_overlap/test_sort_map.py
 * `test_sort_map.py` 全部 diff 0；`cuobjdump -res-usage` 三个实例化都是 REG≤32、STACK/LOCAL 全 0
 
 
+9.10: 移除 epilogue swiglu 融合，前反向均使用独立 swiglu 算子
+* 因为后续计划往 activation 阶段加入更多计算，当前融合算子无法满足需求，且维护困难，因此暂时移除；实际上目前测试下来融合 swiglu 虽然对单个算子有影响，但放到端到端影响极小，后续如果还有明确需求再加回来

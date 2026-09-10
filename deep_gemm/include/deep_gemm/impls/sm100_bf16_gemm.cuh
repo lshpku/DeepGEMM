@@ -30,13 +30,11 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t kKAlignment,
           bool kSwapAB, bool kEnsureZeroPadding,
           GemmType kGemmType, bool kWithAccumulation, typename cd_dtype_t,
-          uint64_t kTensorCoreUtilControl,
-          bool kWithFusedSwiGLU = false>
+          uint64_t kTensorCoreUtilControl>
 CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_bf16_gemm_impl(int* grouped_layout,
                      uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                      uint32_t task_idx,
-                     const float* fused_probs, cutlass::bfloat16_t* fused_o2, uint32_t fused_ld_o2,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
@@ -445,14 +443,13 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                 epilogue::sm100_store_cd_swap_ab<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
                     kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
                     kGemmType, kWithAccumulation,
-                    cd_dtype_t, epilogue::transform::EpilogueIdentity, kWithFusedSwiGLU>
+                    cd_dtype_t, epilogue::transform::EpilogueIdentity>
                 (smem_cd, tma_stage_idx, tmem_base_addr,
                  base_m_idx, base_n_idx, scheduler.current_group_idx,
                  effective_m,
                  epilogue_warp_idx, lane_idx,
                  tmem_empty_barriers[accum_stage_idx],
-                 tensor_map_cd,
-                 fused_probs, fused_o2, fused_ld_o2);
+                 tensor_map_cd);
             } else {
                 epilogue::sm100_store_cd<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
                     kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
