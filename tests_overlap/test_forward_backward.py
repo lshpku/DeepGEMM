@@ -15,7 +15,10 @@ paddle.seed(0)
 import deep_gemm
 print("deep_gemm:", deep_gemm.__path__)
 
-from utils import make_deepep_layout, make_atomic_layout
+from utils import (
+    make_deepep_layout, make_atomic_layout, make_task_queue, interleave_gateup,
+    deinterleave_gateup, get_atomic_perm,
+)
 
 # 使用特别编译的注释掉 deep_gemm 的版本, 不然会和我们的头文件冲突
 import paddlefleet_ops
@@ -33,6 +36,7 @@ NUM_SMS = 100
 ALIGNMENT = 128
 PRECISE_SWIGLU = False
 INTERLEAVED = False
+ORDERED_WGRAD = False
 
 
 class Result(NamedTuple):
@@ -46,52 +50,28 @@ class Result(NamedTuple):
     dx: Tensor
     drecv_x: Tensor
     drecv_probs: Tensor
-    o2_bwd: Tensor = None
+    w_gateup_grad: Tensor
+    w_down_grad: Tensor
+    o2_bwd: Tensor
 
     def __getitem__(self, key: str):
         return getattr(self, key)
 
 
-def make_task_queue(counts, m_start, ready, seed=0):
-    """The chunk arrival queue: one `[expert_idx, m_start, m_size, ready]` row per task.
+def run_wgrad(tokens_per_expert, x, do1, w_gateup_grad, o2, do3, w_down_grad):
+    ks_cpu = [(n + ALIGNMENT - 1) // ALIGNMENT * ALIGNMENT for n in tokens_per_expert]
+    grouped_layout = paddle.to_tensor(ks_cpu, dtype="int32")
 
-    A real DeepEP dispatch appends a row when a chunk lands, so the expert order is
-    random while chunks of one expert stay ordered.
-    """
-    per_expert_tasks = []
-    for expert_idx, (count, start) in enumerate(zip(counts, m_start)):
-        per_expert_tasks.append([
-            [expert_idx, start + offset, min(CHUNK, count - offset), ready]
-            for offset in range(0, count, CHUNK)
-        ])
-
-    # Interleave experts randomly, keeping each expert's chunks in order
-    rng = np.random.default_rng(seed)
-    cursors, remaining, queue = [0] * E, [len(tasks) for tasks in per_expert_tasks], []
-    while sum(remaining) > 0:
-        candidates = [i for i in range(E) if remaining[i] > 0]
-        i = candidates[rng.integers(len(candidates))]
-        queue.append(per_expert_tasks[i][cursors[i]])
-        cursors[i] += 1
-        remaining[i] -= 1
-
-    assert len(queue[0]) == deep_gemm.num_chunk_task_fields
-    return paddle.to_tensor(queue, dtype="int32")
+    paddle.base.core.nvprof_nvtx_push("wgrad")
+    deep_gemm.k_grouped_bf16_gemm_tn_contiguous(
+        x, do1, w_gateup_grad, ks_cpu, grouped_layout, w_gateup_grad)
+    deep_gemm.k_grouped_bf16_gemm_tn_contiguous(
+        o2, do3, w_down_grad, ks_cpu, grouped_layout, w_down_grad)
+    paddle.base.core.nvprof_nvtx_pop()
 
 
-def interleave_gateup(w_gateup):
-    """`[gate | up]` -> `[gate[0], up[0], gate[1], up[1], ...]` per expert, fully interleaved."""
-    perm = np.empty([2 * I], dtype=np.int32)
-    perm[0::2] = np.arange(I)
-    perm[1::2] = np.arange(I) + I
-    return w_gateup.index_select(paddle.to_tensor(perm), axis=2).contiguous()
-
-
-def deinterleave_gateup(w_gateup):
-    return paddle.concat([w_gateup[..., 0::2], w_gateup[..., 1::2]], axis=-1)
-
-
-def reference(recv_x, recv_probs, topk_indices, tokens_per_expert, m_indices, w_gateup, w_down, dout):
+def reference(recv_x, recv_probs, topk_indices, tokens_per_expert, m_indices,
+              w_gateup, w_down, dout):
     topk_indices = topk_indices.cast("int32")
 
     ################################# Forward ##################################
@@ -155,11 +135,20 @@ def reference(recv_x, recv_probs, topk_indices, tokens_per_expert, m_indices, w_
         num_experts=E,
     )
 
-    return Result(x, o1, o2, o3, out, do2, do1, dx, drecv_x, drecv_probs)
+    ################################## Wgrad ###################################
+
+    # wgrad 使用累加语义, 输入需要置 0, 实际执行的时候是预处理, 无成本
+    w_gateup_grad = paddle.zeros(w_gateup.shape, dtype="float32")
+    w_down_grad = paddle.zeros(w_down.shape, dtype="float32")
+
+    run_wgrad(tokens_per_expert, x, do1, w_gateup_grad, o2, do3, w_down_grad)
+
+    return Result(x, o1, o2, o3, out, do2, do1, dx, drecv_x, drecv_probs,
+                  w_gateup_grad, w_down_grad, o2)
 
 
-def compute_chunk(recv_x, recv_probs, topk_indices, w_gateup, w_down, dout,
-                  atomic_to_zip, zip_to_atomic, atomic_to_zip_bwd, zip_to_atomic_bwd,
+def compute_chunk(recv_x, recv_probs, topk_indices, tokens_per_expert, m_start, w_gateup, w_down,
+                  dout, atomic_to_zip, zip_to_atomic, atomic_to_zip_bwd, zip_to_atomic_bwd,
                   task_queue, task_queue_bwd):
     num_valid_topk = (topk_indices != -1).sum(axis=-1, dtype="int32")
 
@@ -219,21 +208,38 @@ def compute_chunk(recv_x, recv_probs, topk_indices, w_gateup, w_down, dout,
         paddle.base.core.nvprof_nvtx_pop()
     paddle.base.core.nvprof_nvtx_pop()
 
-    return Result(x, o1, o2, o3, out, do2, do1, dx, drecv_x, drecv_probs, o2_bwd)
+    ################################## Wgrad ###################################
 
+    w_gateup_grad = paddle.zeros(w_gateup.shape, dtype="float32")
+    w_down_grad = paddle.zeros(w_down.shape, dtype="float32")
 
-def get_atomic_perm(tokens_per_expert, m_start, atomic_to_zip):
-    """将 atomic 序的 o1/o2/o3 等转换为参考序的映射表, padding 保留原位."""
-    perm = paddle.arange(m_start[-1])
-    for n, offset in zip(tokens_per_expert, m_start):
-        perm[offset : offset + n] = atomic_to_zip[offset : offset + n].argsort() + offset
-    return perm
+    if ORDERED_WGRAD:
+        m_start_gpu = paddle.to_tensor(m_start, dtype="int32")
+
+        # x 从 recv_x 中解压, 这里使用 gather 并非最优性能, 因为重复读了 recv_x 的某些行
+        ordered_to_zip = deep_gemm.sort_unzip_map(zip_to_atomic_bwd, m_start_gpu, len(x))
+        x_wgrad = deep_gemm.token_gather(recv_x, ordered_to_zip)
+
+        # do1/o2_bwd/do3 从反向 atomic 序的输入重排序为标准 unzip 序
+        ordered_to_atomic = deep_gemm.sort_atomic_map(zip_to_atomic_bwd, m_start_gpu, len(x))
+        do1_wgrad = deep_gemm.token_gather(do1, ordered_to_atomic)
+        o2_wgrad = deep_gemm.token_gather(o2_bwd, ordered_to_atomic)
+        do3_wgrad = deep_gemm.token_gather(do3, ordered_to_atomic)
+    else:
+        x_wgrad = deep_gemm.token_gather(recv_x, atomic_to_zip_bwd)
+        do1_wgrad, o2_wgrad, do3_wgrad = do1, o2_bwd, do3
+
+    run_wgrad(tokens_per_expert, x_wgrad, do1_wgrad, w_gateup_grad,
+              o2_wgrad, do3_wgrad, w_down_grad)
+
+    return Result(x, o1, o2, o3, out, do2, do1, dx, drecv_x, drecv_probs,
+                  w_gateup_grad, w_down_grad, o2_bwd)
 
 
 def check(x, y):
     diff = (x.float() - y.float()).abs()
     avg, max = float(diff.mean()), float(diff.max())
-    banner = (" " + "-" * 40) if (avg or max) else ""
+    banner = (" " + ("-" if avg < 1e-3 else "X") * 40) if (avg or max) else ""
     avg = "0" if avg == 0 else f"{avg:e}"
     max = "0" if max == 0 else f"{max:e}"
     return f"avg: {avg} max: {max}" + banner
@@ -264,13 +270,13 @@ def main():
     atomic_to_zip_bwd, zip_to_atomic_bwd = make_atomic_layout(
         topk_indices, tokens_per_expert, m_start)
 
-    task_queue = make_task_queue(tokens_per_expert, m_start, ready=True, seed=0)
-    task_queue_bwd = make_task_queue(tokens_per_expert, m_start, ready=True, seed=1)
+    task_queue = make_task_queue(tokens_per_expert, m_start, CHUNK, ready=True, seed=0)
+    task_queue_bwd = make_task_queue(tokens_per_expert, m_start, CHUNK, ready=True, seed=1)
 
     paddle.base.core.nvprof_start()
-    outs = compute_chunk(recv_x, recv_probs, topk_indices, w_gateup, w_down, dout,
-                         atomic_to_zip, zip_to_atomic, atomic_to_zip_bwd, zip_to_atomic_bwd,
-                         task_queue, task_queue_bwd)
+    outs = compute_chunk(recv_x, recv_probs, topk_indices, tokens_per_expert, m_start,
+                         w_gateup, w_down, dout, atomic_to_zip, zip_to_atomic,
+                         atomic_to_zip_bwd, zip_to_atomic_bwd, task_queue, task_queue_bwd)
     paddle.base.core.nvprof_stop()
 
     ################################# Validate #################################
@@ -281,19 +287,17 @@ def main():
     checks = [
         (("x", "o1", "o2", "o3"), fwd_perm),
         (("out",), None),
-        (("do2", "do1", "dx"), bwd_perm),
-        (("drecv_x", "drecv_probs"), None),
+        (("do2", "do1", "dx", "o2_bwd"), bwd_perm),
+        (("drecv_x", "drecv_probs", "w_gateup_grad", "w_down_grad"), None),
     ]
 
     for names, perm in checks:
         for name in names:
             out, ref = outs[name], refs[name]
             out = out[perm] if perm is not None else out
-            out = deinterleave_gateup(out) if (INTERLEAVED and "o1" in name) else out
+            if INTERLEAVED and ("o1" in name or "gateup" in name):
+                out = deinterleave_gateup(out)
             print(f"{name}:", check(out, ref))
-
-    print("o2_bwd vs ref:", check(outs["o2_bwd"][bwd_perm], refs["o2"]))
-    print("o2_bwd vs fwd:", check(outs["o2_bwd"][bwd_perm], outs["o2"][fwd_perm]))
 
 
 if __name__ == "__main__":
@@ -302,9 +306,12 @@ if __name__ == "__main__":
                         help="Use precise swiglu, only applies for unfused swiglu")
     parser.add_argument("--interleaved", action="store_true",
                         help="Use fully-interleaved w_gateup, only applies for unfused swiglu")
+    parser.add_argument("--ordered-wgrad", action="store_true",
+                        help="Use standard deterministic order for wgrad")
     args = parser.parse_args()
 
     PRECISE_SWIGLU = args.precise_swiglu
     INTERLEAVED = args.interleaved
+    ORDERED_WGRAD = args.ordered_wgrad
 
     main()
