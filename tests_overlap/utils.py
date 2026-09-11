@@ -1,3 +1,5 @@
+import numpy as np
+
 import paddle
 
 
@@ -59,3 +61,47 @@ def make_atomic_layout(topk_indices, tokens_per_expert, m_start):
         )
 
     return atomic_to_zip, zip_to_atomic
+
+
+def make_task_queue(counts, m_start, chunk, ready, seed=0):
+    """The chunk arrival queue: one `[expert_idx, m_start, m_size, ready]` row per task.
+
+    A real DeepEP dispatch appends a row when a chunk lands, so the expert order is
+    random while chunks of one expert stay ordered.
+    """
+    per_expert_tasks = []
+    for expert_idx, (count, start) in enumerate(zip(counts, m_start)):
+        per_expert_tasks.append([
+            [expert_idx, start + offset, min(chunk, count - offset), ready]
+            for offset in range(0, count, chunk)
+        ])
+
+    # Interleave experts randomly, keeping each expert's chunks in order
+    rng = np.random.default_rng(seed)
+    cursors, remaining, queue = [0] * len(counts), [len(tasks) for tasks in per_expert_tasks], []
+    while sum(remaining) > 0:
+        candidates = [i for i, n in enumerate(remaining) if n > 0]
+        i = candidates[rng.integers(len(candidates))]
+        queue.append(per_expert_tasks[i][cursors[i]])
+        cursors[i] += 1
+        remaining[i] -= 1
+
+    return paddle.to_tensor(queue, dtype="int32")
+
+
+def interleave_gateup(w_gateup):
+    """`[gate | up]` -> `[gate[0], up[0], gate[1], up[1], ...]` per expert, fully interleaved."""
+    gate, up = w_gateup.chunk(2, axis=-1)
+    return paddle.concat([gate[..., None], up[..., None]], axis=-1).reshape(w_gateup.shape)
+
+
+def deinterleave_gateup(w_gateup):
+    return paddle.concat([w_gateup[..., 0::2], w_gateup[..., 1::2]], axis=-1)
+
+
+def get_atomic_perm(tokens_per_expert, m_start, atomic_to_zip):
+    """将 atomic 序的 o1/o2/o3 等转换为参考序的映射表, padding 保留原位."""
+    perm = paddle.arange(m_start[-1])
+    for n, offset in zip(tokens_per_expert, m_start):
+        perm[offset : offset + n] = atomic_to_zip[offset : offset + n].argsort() + offset
+    return perm

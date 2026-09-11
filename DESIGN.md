@@ -54,7 +54,10 @@ deep_gemm 是支持动态 M 的，它可以在领任务的时候才知道 M 是�
 
 需要实现一个新的 swiglu 或直接将 swiglu 融合到 gateup 的 epilogue；我们的模型算法实际用的是 weighted_swiglu，就是 router_score 在这里乘进去而不是在 zip 的时候；由于 Paddle 原有算子不支持动态 M，需要新写一个
 
-计算 kernel 都需要使用 persistent 的形式，就是使用固定数量的 SM，SM 自己分配任务；目前安排的是计算流（gateup+swiglu+down+done）用 96SM，其他是给通信和 zip 用的；大家统一用 2-CTA 形式，这样 launch 不会导致 1-CTA 和 2-CTA 之间冲突，其实官方 DeepEP 早就默认是 2-CTA 了，反而计算这边很多 kernel 迟迟没跟进
+SM 使用约定如下：
+* GEMM 需要使用 persistent kernel 的形式，也就是只使用固定式数量的 SM，当然 deep_gemm 本身已支持
+* swiglu/swiglu_grad 则使用普通风格，因为这两个 kernel 属于 element-wise，更适合使用大量 block 来撑起并行度；由于两者执行时间很短，不会阻塞通信 kernel 的 launch；通信 kernel launch 以后硬件会保证只给它们分配通信不用的 SM，不会影响通信运行
+* zip 也使用 persistent kernel 的形式，但不是因为影响通信，而是 zip 需要做一个 block 内的 task 入队操作，只有 persistent 下才方便实现，否则需要复杂的同步逻辑
 
 
 ### buffer设计
@@ -165,3 +168,52 @@ drecv_probs 是一个和 recv_token_indices 相同 shape 和 token 槽位的 ten
 
 `token_gather`
 * 类似 paddle.gather(x, index, axis=0)，但是对于 -1 的下标直接写 0（paddle 对于 -1 下标是理解为 len(x)-1，这不符合 padding 的要求）
+
+
+### FP8 支持
+
+简单来说，FP8 和 BF16 的区别就是把 dispatch 和矩阵乘（gateup、down）换成 FP8；zip 和 combine 保持 BF16，因为两者有累加语义，需要保持较高精度
+
+Paddle 现行的 FP8 baseline 流程可见单测 tests_overlap/test_forward_backward_fp8.py，这份 FP8 baseline 性能比 BF16 baseline 快了 30%，但是仍然存在一些问题，尤其是对当前 overlap 机制不友好：
+
+* wgrad 仍然保持了 BF16：这其实并非因为算法上真的对精度有那么高要求，而是早期 FP8 k_group_gemm 实现有精度问题，所以就长期保留了 BF16；事实上，现在很多竞品都在用 FP8 wgrad，甚至有更低精度的；使用 BF16 wgrad 会导致反向 dispatch 需要维持 BF16，且流程中有大量与前向不对称的 quant，对通信和计算都是负担
+
+
+下图是我针对 overlap 方案设计的新 FP8 流程图，可以看到前反向的算子完全对称了，所有矩阵乘都使用 FP8：
+
+```
+ [dispatch+unzip]      [zip+combine]
+        |                    ^
+        v                    |
+ (x_fp8, x_scale)        (dx_bf16)
+        | \__________________^___________________
+        v                    |                   v
+    [gateup]           [gateup_grad]       [gateup_wgrad]
+        |                    ^   ________________^
+        v                    | /
+    (o1_bf16)       (do1_fp8, do1_scale)
+        |                    ^
+        v                    |
+  [swiglu+quant]    [swiglu_grad+quant]
+        |                    ^
+        v                    |
+(o2_fp8, o2_scale)      (do2_bf16)
+        | \__________________^___________________
+        v                    |                   v
+     [down]             [down_grad]         [down_wgrad]
+        |                    ^   ________________^
+        v                    | /
+    (o3_bf16)       (do3_fp8, do3_scale)
+        |                    ^
+        v                    |
+  [zip+combine]         [dispatch]
+```
+
+新方案相比 BF16 只需要新实现 2 个主要算子：swiglu+quant 和 swiglu_grad+quant；另外，可能需要若干 reorder 算子用于给 wgrad 重排 FP8 的 scale
+
+FP8 scale 有一个特殊之处需要特别说明：
+* DeepGEMM 所有算子的 scale 的底层都是需要是 transpose 的，就是相对于 weight 的 layout 是 transpose 的，且必须向 512B 对齐，这是为了 TMA 加载的连续性；但是表面的 shape 还是不 transpose 的，不要调用 contiguous
+* 在 baseline 里，由于 dispatch 不支持发送 transpose 的 scale，所以发送的时候是 contiguous 的，发完再由计算自己 transpose；这对 baseline 影响不大，因为 scale 本身很小，对整个完整的 scale tensor 调用一次 transpose 的成本相比后面的大矩阵乘可以忽略，另外 baseline 做了一些融合优化，实际上把 transpose 融合到前面的算子里了
+* 但是在 overlap 里有一个违和点，就是 overlap 是 chunk 执行的，scale 需要按 chunk 进行 transpose，而不是整个一次性 transpose，不然连续性就不对了；所以我想让通信那边改一下，在输出 unzipped_scale 时就进行分 chunk 的 transpose
+* 也就是，在表面看来，unzipped_scale 仍然是 [num_unzipped_tokens, H/512]，但其实里面的 layout 是这样：对于一个 chunk 的 unzipped_scale[m_start : m_start+m_size]，其实是先理解为将其 view 为 [H/512, m_size]，然后转置但不调用 contiguous
+* 上面说的是 x_scale，其实其他 o2/do3/do1_scale 都是相同逻辑；这并不违反 512B 对齐，因为 DeepGEMM 要求 token 向 128 对齐，128 个 token 至少有 128 个 int scale，也就是 512B，因此即使是最小的 chunk 也能做到对齐
