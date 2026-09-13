@@ -23,28 +23,23 @@
   * 收到一个 chunk 意味着有了属于某个专家的 chunk 个连续的 token 可以立即用于计算
   * 需要注意的是哪个专家的哪个 chunk 先抵达是运行时随机的，但是总 chunk 数是知道的，DeepEP 在通信开始前已完成路由信息交换
   * chunk 大小是固定的比如 4096，但是对于一个专家最后的余数部分是可能不满 4096 的，计算 kernel 应当能够处理这种情况且避免计算空转
-  * 目前已由其他组同事完成 chunk 到达信号记录的实现，也就是显存上有一个队列，记录当前收到的 (expert_id, chunk_id) 序列，但 kernel 还在调试还没给到我，开发时可以自己写一个队列在单卡模拟这种情况，这样也方便单卡调试
+  * 目前已由其他组同事完成通信部分的实现，并成功完成了 BF16 版本的联调；为了方便开发，本仓库不含任何通信 kernel，本仓库的单测只需保证计算部分的正确性
 
-3. 计算部分，使用 DeepGEMM 的 bf16 矩阵乘 + 自己实现的 swiglu，具体调用方法为：
-  * 由于 n_chunks 在计算开始前已知，所以在开始时 CPU 直接往计算流发射 n_chunks 组 (gateup, swiglu, down, done) 算子（也就是一共 n_chunks\*4 个算子，融合 gateup+swiglu 的话就是 n_chunks*3）
+3. 计算部分，使用 DeepGEMM 的 bf16 矩阵乘 + 自己实现的 swiglu + 自己实现的 zip，具体调用方法为：
+  * 由于 n_chunks 在计算开始前已知，所以在开始时 CPU 直接往计算流发射 n_chunks 组 (gateup, swiglu, down, zip) 算子（也就是一共 n_chunks\*4 个算子）
   * 每个算子的输入指针不指定，靠从队列里获取，由于计算流内部天然阻塞，所以不存在一个算子抢另一个算子的任务的情况，任务一定是一个一个完成，最后恰好 n_chunks 组算子做完所有任务
-  * 每组算子完成任务后，首先往一个表记录每个 token 的完成情况（已经被几个专家完成），对于已经被所有专家完成的 token 即可发往下一步；由于这个 “记录” 操作和 gemm 不好融合，所以新增一个 done 算子来进行记录和入队操作
+  * 每组算子完成任务后，首先往一个表记录每个 token 的完成情况（已经被几个专家完成），对于已经本机上的 topk 个所属专家完成的 token 即可进行 zip
+  * zip 算子需要同时负责如下工作：更新 token 完成情况、求和输出到 combine 的输入 buffer、更新 combine 输入就绪信号
 
-4. zip 与 combine 部分，zip 是一个单独的 persistent kernel，combine 也使用 DeepEP，增加信号等待逻辑：
-  * zip 通过读计算完成队列，对于一个不重复 token，当它 topk 的所有专家都计算完就对其进行求和操作，写到 combine 的输入 buffer
+4. combine 部分，也使用 DeepEP，增加信号等待逻辑：
   * combine 和 dispatch 同一个流，所以一定在 dispatch 完成后才启动
-  * comine 同样增加一个等待逻辑，等输入 buffer 里的一个 token 就绪之后才发出
-  * zip+comine 逻辑同样由另一组同事开发，已经论证过正确性，我这里只需要正确给出 token 完成信号
+  * comine 增加一个等待逻辑，等输入 buffer 里的一个 token 就绪之后才发出；我们的 zip 只需保证写入正确的 token 位置和信号
 
 
 <b>关于chunk的说明：</b>其实通信并不是严格按chunk发送的，它相当于是细水长流地并发收到各个专家的token，然后push到各个专家的buffer上，我所谓的“概念上”指的是当一个专家每凑够chunk数量的token时，就理解为它的一个chunk到达了，并不是说一个chunk突然就一次性到达了。使用chunk这个概念是为了保证GEMM的连续性，因为我们是训练场景，如果每到一个token就计算，性能肯定非常差。
 
-<b>关于zip：</b>目前计算这边自己也实现了一个 zip，融合到 signal_done 里了，每个 chunk 调用一次，用于替代通信的 persistent zip，理论上可以给计算换更多的 SM；目前实测我们的 zip 性能更好，之后基本只维护我们的 zip 即可。
-
 
 ## 计算部分设计细节
-
-下面的细节可以讨论
 
 ### kernel选型
 
@@ -56,7 +51,7 @@ deep_gemm 是支持动态 M 的，它可以在领任务的时候才知道 M 是�
 
 SM 使用约定如下：
 * GEMM 需要使用 persistent kernel 的形式，也就是只使用固定式数量的 SM，当然 deep_gemm 本身已支持
-* swiglu/swiglu_grad 则使用普通风格，因为这两个 kernel 属于 element-wise，更适合使用大量 block 来撑起并行度；由于两者执行时间很短，不会阻塞通信 kernel 的 launch；通信 kernel launch 以后硬件会保证只给它们分配通信不用的 SM，不会影响通信运行
+* swiglu/swiglu_grad 则使用 element-wise 风格，因为两者的计算特性更适合用大量 block 来撑起并行度；由于两者执行时间很短，不会阻塞通信 kernel 的 launch；通信 kernel launch 以后硬件会保证只给它们分配通信不用的 SM，不会影响通信运行
 * zip 也使用 persistent kernel 的形式，但不是因为影响通信，而是 zip 需要做一个 block 内的 task 入队操作，只有 persistent 下才方便实现，否则需要复杂的同步逻辑
 
 

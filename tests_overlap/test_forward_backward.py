@@ -173,7 +173,7 @@ def compute_chunk(recv_x, recv_probs, topk_indices, tokens_per_expert, m_start, 
     paddle.base.core.nvprof_nvtx_push("forward")
     for task_idx in range(len(task_queue)):
         deep_gemm.bf16_chunk_gemm_nn(x, w_gateup, o1, task_queue, task_idx)
-        deep_gemm.chunk_weighted_swiglu(o1, probs, o2, task_queue, task_idx,
+        deep_gemm.chunk_weighted_swiglu(o1, probs, o2, task_queue, task_idx, CHUNK,
                                         precise=PRECISE_SWIGLU, interleaved=INTERLEAVED)
         deep_gemm.bf16_chunk_gemm_nn(o2, w_down, o3, task_queue, task_idx)
         deep_gemm.chunk_zip(o3, out, atomic_to_zip, zip_to_atomic, topk_indices, num_valid_topk,

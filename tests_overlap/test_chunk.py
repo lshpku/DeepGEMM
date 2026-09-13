@@ -29,7 +29,7 @@ SEQLEN = 16384
 TOPK = 8
 
 CHUNK = 4096
-NUM_SMS = 96
+NUM_SMS = 100
 ALIGNMENT = 128
 
 
@@ -133,20 +133,6 @@ def make_task_queue(counts, m_start, ready, seed=0):
     return paddle.to_tensor(queue, dtype="int32")
 
 
-def interleave_gateup(w_gateup):
-    """`[gate | up]` -> `[gate[0], up[0], gate[1], up[1], ...]` per expert, the Paddle layout."""
-    perm = np.empty([2 * I], dtype=np.int32)
-    perm[0::2] = np.arange(I)
-    perm[1::2] = np.arange(I) + I
-    return w_gateup.index_select(paddle.to_tensor(perm), axis=2).contiguous()
-
-
-def split_gate_up(o1):
-    """The gate/up halves of `o1`, which is in the fully interleaved column order."""
-    blocks = o1.reshape([o1.shape[0], I, 2])
-    return blocks[:, :, 0], blocks[:, :, 1]
-
-
 def reference(x, w_gateup, w_down, probs, m_indices, perf=None):
     if perf is not None:
         # 模拟调用 zip/unzip, 实际结果无用
@@ -177,7 +163,7 @@ def reference(x, w_gateup, w_down, probs, m_indices, perf=None):
         gate, up = o1[:x.shape[0] // 2], o1[x.shape[0] // 2:]
         o2 = (gate + up).reshape([x.shape[0], I])
     else:
-        gate, up = split_gate_up(o1)
+        gate, up = o1.chunk(2, axis=-1)
         gate, up = gate.float(), up.float()
         o2 = ((gate * F.sigmoid(gate)) * up * probs.unsqueeze(-1)).astype("bfloat16")
 
@@ -201,7 +187,7 @@ def compute_chunk(task_idx, buffers, task_queue):
     (x, w_gateup, w_down, probs, o1, o2, o3,
      atomic_to_zip, num_valid_topk, token_done, zip_task_queue, zip_queue_tail) = buffers
     deep_gemm.bf16_chunk_gemm_nn(x, w_gateup, o1, task_queue, task_idx)
-    deep_gemm.chunk_weighted_swiglu(o1, probs, o2, task_queue, task_idx, precise=True)
+    deep_gemm.chunk_weighted_swiglu(o1, probs, o2, task_queue, task_idx, CHUNK, precise=True)
     deep_gemm.bf16_chunk_gemm_nn(o2, w_down, o3, task_queue, task_idx)
     deep_gemm.chunk_signal_token_done(atomic_to_zip, num_valid_topk, token_done,
                                       zip_task_queue, zip_queue_tail, task_queue, task_idx)
@@ -235,8 +221,6 @@ def main():
     w_gateup = paddle.randn([E, H, 2 * I], "bfloat16") * 0.02
     w_down = paddle.randn([E, I, H], "bfloat16") * 0.02
     probs = paddle.rand([m_total], "float32")
-
-    w_gateup = interleave_gateup(w_gateup)
 
     deep_gemm.set_num_sms(NUM_SMS)
     o1_ref, o2_ref, o3_ref = reference(x, w_gateup, w_down, probs, m_indices)

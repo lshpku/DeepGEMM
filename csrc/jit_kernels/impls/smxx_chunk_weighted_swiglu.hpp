@@ -16,7 +16,7 @@ public:
     struct Args {
         LaunchArgs launch_args;
 
-        int num_sms, num_threads, num_elems_per_access;
+        int num_threads, num_elems_per_access;
         int num_vecs_per_row, num_vecs_per_thread;
         bool precise, interleaved;
         void* task_queue;
@@ -35,11 +35,11 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&smxx_chunk_weighted_swiglu_impl<
-        {}, {}, {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}
     >);
 }};
 )",
-        args.num_sms, args.num_threads, args.num_elems_per_access, args.num_vecs_per_row,
+        args.num_threads, args.num_elems_per_access, args.num_vecs_per_row,
         args.num_vecs_per_thread, args.precise, args.interleaved);
     }
 
@@ -57,19 +57,21 @@ static void smxx_chunk_weighted_swiglu(const torch::Tensor& o1,
                                        const torch::Tensor& o2,
                                        const torch::Tensor& task_queue,
                                        const int& task_idx,
+                                       const int& chunk_size,
                                        const bool& precise,
                                        const bool& interleaved) {
-    constexpr int kNumThreads = 1024;
+    constexpr int kNumThreads = 256;
     constexpr int kNumElemsPerAccess = 8;
     constexpr int kNumVecsPerThread = 2;
+    constexpr auto kNumVecsPerBlock = kNumThreads * kNumVecsPerThread;
 
-    const auto num_sms = device_runtime->get_num_sms();
     const auto shape_n = static_cast<int>(o2.size(-1));
     DG_HOST_ASSERT(shape_n % kNumElemsPerAccess == 0);
+    const auto num_vecs = shape_n / kNumElemsPerAccess * chunk_size;
+    const auto num_blocks = (num_vecs + kNumVecsPerBlock - 1) / kNumVecsPerBlock;
 
     const SMXXChunkWeightedSwigluRuntime::Args args = {
-        .launch_args = LaunchArgs(num_sms, kNumThreads),
-        .num_sms = num_sms,
+        .launch_args = LaunchArgs(num_blocks, kNumThreads),
         .num_threads = kNumThreads,
         .num_elems_per_access = kNumElemsPerAccess,
         .num_vecs_per_row = shape_n / kNumElemsPerAccess,
