@@ -128,6 +128,8 @@ smxx_chunk_weighted_swiglu_grad_impl(const int* task_queue, uint32_t task_idx,
     const auto fwd_row = blockIdx.x < m_size ? smem_fwd_row : bwd_row;
     const auto prob = probs[fwd_row];
     float dprobs_sum = 0.0;
+    constexpr auto kNumVec4 = kNumElemsPerAccess / 4;
+    float dprobs_sum_vec4[kNumVec4] = {};
 
     // The exponents are staged and flushed as whole int32 packs to improve cache granularity
     __shared__ __align__(4) uint8_t smem_exp_o2[kQuant ? kNumScalesPerRow : 1];
@@ -137,6 +139,7 @@ smxx_chunk_weighted_swiglu_grad_impl(const int* task_queue, uint32_t task_idx,
         const auto off = static_cast<uint64_t>(bwd_row) * kNumVecsPerRow + col;
         const auto do2_vec = __ldg(reinterpret_cast<const vec_t*>(do2) + off);
         vec_t lo_vec, hi_vec, o2_vec, d_lo_vec, d_hi_vec;
+        float d_act[4], w_act[4];
         float o2_act[kNumElemsPerAccess], dg_act[kNumElemsPerAccess], du_act[kNumElemsPerAccess];
 
         if constexpr (kInterleaved) {
@@ -180,7 +183,21 @@ smxx_chunk_weighted_swiglu_grad_impl(const int* task_queue, uint32_t task_idx,
             const auto dg = kPrecise ? dw * u * s * (1.0f + g * (1.0f - s))
                                      : dw * (u * (s * ((g + 1.0f) - silu)));
 
-            dprobs_sum += d * w;
+            // NOTES: paddle quant path reduces in vec4 instead of vec8. Here we split the vec8
+            //        into two vec4 and reduce them separately
+            // NOTES: we save d/w_act and do sum every 4 pairs together to match the exact FMA
+            //        order in paddle
+            if constexpr (kQuant) {
+                d_act[i % 4] = d;
+                w_act[i % 4] = w;
+                if (i % 4 == 3) {
+                    const auto dprobs = d_act[0] * w_act[0] + d_act[1] * w_act[1] +
+                                        d_act[2] * w_act[2] + d_act[3] * w_act[3];
+                    dprobs_sum_vec4[i / 4] += dprobs;
+                }
+            } else {
+                dprobs_sum += d * w;
+            }
 
             if constexpr (kQuant) {
                 // NOTES: rounds through BF16 here because the paddle reference path downcasts
@@ -227,8 +244,15 @@ smxx_chunk_weighted_swiglu_grad_impl(const int* task_queue, uint32_t task_idx,
         }
     }
 
-    __shared__ float smem_dprobs_sum[kNumThreads];
-    smem_dprobs_sum[threadIdx.x] = dprobs_sum;
+    constexpr auto kReduceDim = kQuant ? kNumThreads * kNumVec4 : kNumThreads;
+    __shared__ float smem_dprobs_sum[kReduceDim];
+    if constexpr (kQuant) {
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumVec4; ++ i)
+            smem_dprobs_sum[threadIdx.x * kNumVec4 + i] = dprobs_sum_vec4[i];
+    } else {
+        smem_dprobs_sum[threadIdx.x] = dprobs_sum;
+    }
     __syncthreads();
 
     if constexpr (kQuant) {
@@ -240,13 +264,13 @@ smxx_chunk_weighted_swiglu_grad_impl(const int* task_queue, uint32_t task_idx,
 
     // Reduce dprobs in warp 0. Strictly fold the back half to the front half
     if (warp_idx == 0) {
-        float reg_dprobs_sum[kNumThreads / 32];
+        float reg_dprobs_sum[kReduceDim / 32];
         #pragma unroll
-        for (uint32_t i = 0; i < kNumThreads / 32; ++ i)
+        for (uint32_t i = 0; i < kReduceDim / 32; ++ i)
             reg_dprobs_sum[i] = smem_dprobs_sum[i * 32 + lane_idx];
 
         #pragma unroll
-        for (uint32_t stride = kNumThreads / 64; stride > 0; stride /= 2) {
+        for (uint32_t stride = kReduceDim / 64; stride > 0; stride /= 2) {
             #pragma unroll
             for (uint32_t i = 0; i < stride; ++ i)
                 reg_dprobs_sum[i] += reg_dprobs_sum[i + stride];

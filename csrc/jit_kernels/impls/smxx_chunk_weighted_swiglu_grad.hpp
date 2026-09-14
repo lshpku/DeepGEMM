@@ -82,8 +82,10 @@ static void smxx_chunk_weighted_swiglu_grad(const torch::Tensor& o1,
                                             const bool& interleaved) {
     constexpr int kNumElemsPerAccess = 8;
 
+    const auto quant = o2_bwd_scales.has_value();
     const auto num_blocks = chunk_size;
-    const auto num_threads = 256;  // align to paddle reduce stride
+    // Align to paddle reduce stride: BF16 uses 256 threads and vec8; FP8 uses 256 threads and vec4
+    const auto num_threads = quant ? 128 : 256;
     const auto shape_n = static_cast<int>(do2.size(-1));
     DG_HOST_ASSERT(shape_n % kNumElemsPerAccess == 0);
     const auto num_vecs_per_row = shape_n / kNumElemsPerAccess;
@@ -96,7 +98,7 @@ static void smxx_chunk_weighted_swiglu_grad(const torch::Tensor& o1,
         .num_elems_per_access = kNumElemsPerAccess,
         .precise = precise,
         .interleaved = interleaved,
-        .quant = o2_bwd_scales.has_value(),
+        .quant = quant,
         .task_queue = task_queue.data_ptr(),
         .task_idx = static_cast<uint32_t>(task_idx),
         .o1 = o1.data_ptr(),
@@ -108,10 +110,9 @@ static void smxx_chunk_weighted_swiglu_grad(const torch::Tensor& o1,
         .atomic_to_zip = atomic_to_zip.data_ptr(),
         .zip_to_atomic = zip_to_atomic.data_ptr(),
         .recv_token_indices = recv_token_indices.data_ptr(),
-        .o2_bwd_scales = o2_bwd_scales.has_value() ? o2_bwd_scales->data_ptr() : nullptr,
+        .o2_bwd_scales = quant ? o2_bwd_scales->data_ptr() : nullptr,
         .do1_scales = do1_scales.has_value() ? do1_scales->data_ptr() : nullptr,
-        .scale_stride = o2_bwd_scales.has_value() ?
-            static_cast<uint32_t>(o2_bwd_scales->stride(-1)) : 0,
+        .scale_stride = quant ? static_cast<uint32_t>(o2_bwd_scales->stride(-1)) : 0,
         .m_alignment = static_cast<uint32_t>(
             heuristics_runtime->get_mk_alignment_for_contiguous_layout())
     };
