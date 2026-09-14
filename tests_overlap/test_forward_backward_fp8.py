@@ -58,11 +58,48 @@ class Result(NamedTuple):
         return getattr(self, key)
 
 
+def quant_wgrad_input(x):
+    """沿 token 维 128 分块量化, 供 fp8 wgrad 使用.
+
+    k_grouped_fp8_gemm_tn 的收缩维是 token 维 (a 的 shape 为 [sum_k, m]), 而 1D1D recipe 要求
+    scale 沿收缩维分块, 即一个 scale 覆盖 (128 token, 1 channel), 和前向沿 hidden 维的 1x128
+    量化不是同一份数据, 所以 wgrad 必须重新量化一次.
+    """
+    x_fp8_t, scale = paddle.incubate.nn.functional.fp8_quant_blockwise(
+        x,
+        quant_method="1x128",
+        input_transpose=True,
+        return_transpose_only=True,
+        output_scale_transpose=True,
+        # NOTES: 这里只能给 fp32 scale, 由 deep_gemm 自己 pack 成 ue8m0 (kernel:
+        #        pack_fp32_into_ue8m0), 因为 packed ue8m0 是按专家 4 个 K-block 一组打包的,
+        #        要求每个专家的 k 向 gran_k*4=512 对齐, 当前 ALIGNMENT=128 不满足
+        using_pow2_scale=True,
+        using_ue8m0_scale=False,
+    )
+    assert x_fp8_t.shape == [x.shape[1], x.shape[0]]
+    assert scale.shape == [x.shape[0] // 128, x.shape[1]]
+    return x_fp8_t, scale
+
+
+def to_mn_major(quant_pair):
+    """[hidden, token] -> [token, hidden], 仅用于适配 k_grouped tn 的 MN-major 要求.
+
+    这一步不属于方案成本: paddle 的量化算子沿最后一维分块, 所以沿 token 分块就必然把 token 放在
+    最后一维输出; 真实方案里由自己的融合算子直接写出 [token, hidden] 的数据 + 沿 token 分块的
+    scale, 单遍读写即可, 不存在这次转置.
+    """
+    x_fp8_t, scale = quant_pair
+    return x_fp8_t.view("int8").T.contiguous().view("float8_e4m3fn"), scale
+
+
 def reference(recv_x, recv_probs, topk_indices, tokens_per_expert, m_indices,
               w_gateup, w_down, w_gateup_t, w_down_t, dout):
     topk_indices = topk_indices.cast("int32")
 
     ################################# Forward ##################################
+
+    paddle.base.core.nvprof_nvtx_push("forward")
 
     # 前向通信发过来的已经是 fp8 的 x
     recv_x_fp8, recv_scale = recv_x
@@ -106,7 +143,11 @@ def reference(recv_x, recv_probs, topk_indices, tokens_per_expert, m_indices,
         num_experts=E,
     )
 
+    paddle.base.core.nvprof_nvtx_pop()
+
     ################################# Backward #################################
+
+    paddle.base.core.nvprof_nvtx_push("backward")
 
     do3, _, _, _ = paddle.nn.functional.moe_permute(
         dout,
@@ -155,6 +196,8 @@ def reference(recv_x, recv_probs, topk_indices, tokens_per_expert, m_indices,
         num_experts=E,
     )
 
+    paddle.base.core.nvprof_nvtx_pop()
+
     ################################## Wgrad ###################################
 
     ks_cpu = [(n + ALIGNMENT - 1) // ALIGNMENT * ALIGNMENT for n in tokens_per_expert]
@@ -176,6 +219,30 @@ def reference(recv_x, recv_probs, topk_indices, tokens_per_expert, m_indices,
         o2_bwd, do3, w_down_grad, ks_cpu, grouped_layout, w_down_grad)
 
     paddle.base.core.nvprof_nvtx_pop()
+
+    ################################ FP8 Wgrad #################################
+
+    # 用 paddle 的量化算子把 wgrad 的四个输入沿 token 维量化, 再喂给 fp8 的 k_grouped_gemm,
+    # 用于对比 "多出来的量化" 和 "fp8 wgrad 省下来的时间"
+    paddle.base.core.nvprof_nvtx_push("wgrad_fp8_quant")
+    quants = [quant_wgrad_input(t) for t in (x_dequant, do1, o2_bwd, do3)]
+    paddle.base.core.nvprof_nvtx_pop()
+
+    x_q, do1_q, o2_q, do3_q = [to_mn_major(q) for q in quants]
+    w_gateup_grad_fp8 = paddle.zeros(w_gateup[0].shape, dtype="float32")
+    w_down_grad_fp8 = paddle.zeros(w_down[0].shape, dtype="float32")
+
+    paddle.base.core.nvprof_nvtx_push("wgrad_fp8")
+    deep_gemm.k_grouped_fp8_gemm_tn_contiguous(
+        x_q, do1_q, w_gateup_grad_fp8, ks_cpu, grouped_layout, w_gateup_grad_fp8)
+    deep_gemm.k_grouped_fp8_gemm_tn_contiguous(
+        o2_q, do3_q, w_down_grad_fp8, ks_cpu, grouped_layout, w_down_grad_fp8)
+    paddle.base.core.nvprof_nvtx_pop()
+
+    print("w_gateup_grad bf16:", check(w_gateup_grad, paddle.zeros_like(w_gateup_grad)))
+    print("w_gateup_grad fp8 :", check(w_gateup_grad_fp8, w_gateup_grad))
+    print("w_down_grad   bf16:", check(w_down_grad, paddle.zeros_like(w_down_grad)))
+    print("w_down_grad   fp8 :", check(w_down_grad_fp8, w_down_grad))
 
     return Result(x, o1, o2, o3, out, do2, do1, dx, drecv_x, drecv_probs, o2_bwd)
 

@@ -171,7 +171,7 @@ drecv_probs 是一个和 recv_token_indices 相同 shape 和 token 槽位的 ten
 
 Paddle 现行的 FP8 baseline 流程可见单测 tests_overlap/test_forward_backward_fp8.py，这份 FP8 baseline 性能比 BF16 baseline 快了 30%，但是仍然存在一些问题，尤其是对当前 overlap 机制不友好：
 
-* wgrad 仍然保持了 BF16：这其实并非因为算法上真的对精度有那么高要求，而是早期 FP8 k_group_gemm 实现有 bug，所以就长期保留了 BF16；事实上，现在很多竞品都在用 FP8 wgrad，甚至有更低精度的；使用 BF16 wgrad 会导致反向 dispatch 需要维持 BF16，且流程中引入了与前向不对称的 quant/dequant，对通信和计算都是负担
+* wgrad 仍然保持了 BF16：这其实并非因为算法上真的对精度有那么高要求，而是 FP8 k_group_gemm 涉及到较复杂的二次 quant 逻辑，baseline 不想处理，所以就长期保留了 BF16；事实上，现在很多竞品都在用 FP8 wgrad，甚至有更低精度的；使用 BF16 wgrad 会导致反向 dispatch 需要维持 BF16，且流程中引入了与前向不对称的 quant/dequant，对通信和计算都是负担
 
 
 下图是我针对 overlap 方案设计的新 FP8 流程图，可以看到前反向的算子完全对称了，所有矩阵乘都使用 FP8：
@@ -180,35 +180,44 @@ Paddle 现行的 FP8 baseline 流程可见单测 tests_overlap/test_forward_back
  [dispatch+unzip]      [zip+combine]
         |                    ^
         v                    |
- (x_fp8, x_scale)        (dx_bf16)
-        | \__________________^___________________
-        v                    |                   v
-    [gateup]           [gateup_grad]       [gateup_wgrad]
-        |                    ^   ________________^
-        v                    | /
-    (o1_bf16)       (do1_fp8, do1_scale)
-        |                    ^
-        v                    |
+ (x_fp8, x_scale)        (dx_bf16)               (x_wfp8, x_wscale)
+        | \__________________^________[requant]_____^    |
+        v                    |                           v
+    [gateup]           [gateup_grad]               [gateup_wgrad]
+        |                    ^                           ^
+        v                    |                           |
+    (o1_bf16)       (do1_fp8, do1_scale)       (do1_wfp8, do1_wscale)
+        | \_____________     ^ \______[requant]_____^
+        v               v    |
   [swiglu+quant]    [swiglu_grad+quant]
-        |                    ^
-        v                    |
-(o2_fp8, o2_scale)      (do2_bf16)
-        | \__________________^___________________
-        v                    |                   v
-     [down]             [down_grad]         [down_wgrad]
-        |                    ^   ________________^
-        v                    | /
-    (o3_bf16)       (do3_fp8, do3_scale)
-        |                    ^
+        |                    ^ \_(o2_fp8, o2_scale)__[requant]
+        v                    |                           v
+(o2_fp8, o2_scale)      (do2_bf16)              (o2_wfp8, o2_wscale)
+        |                    ^                           |
+        v                    |                           v
+     [down]             [down_grad]                [down_wgrad]
+        |                    ^                           ^
+        v                    |                           |
+    (o3_bf16)       (do3_fp8, do3_scale)       (do3_wfp8, do3_wscale)
+        |                    ^ \______[requant]_____^
         v                    |
   [zip+combine]         [dispatch]
 ```
 
-新方案相比 BF16 只需要新实现 2 个主要算子：swiglu+quant 和 swiglu_grad+quant；另外，可能需要若干 reorder 算子用于给 wgrad 重排 FP8 的 scale
+新方案相比 BF16 只需要新实现 3 个主要算子：swiglu+quant、swiglu_grad+quant、requant；FP8 gemm 只需仿照 BF16 加上信号等待逻辑
 
-FP8 scale 有一个特殊之处需要特别说明：
-* DeepGEMM 所有算子的 scale 的底层都是需要是 transpose 的，就是相对于 weight 的 layout 是 transpose 的，且必须向 512B 对齐，这是为了 TMA 加载的连续性；但是表面的 shape 还是不 transpose 的，不要调用 contiguous
-* 在 baseline 里，由于 dispatch 不支持发送 transpose 的 scale，所以发送的时候是 contiguous 的，发完再由计算自己 transpose；这对 baseline 影响不大，因为 scale 本身很小，对整个完整的 scale tensor 调用一次 transpose 的成本相比后面的大矩阵乘可以忽略，另外 baseline 做了一些融合优化，实际上把 transpose 融合到前面的算子里了
-* 但是在 overlap 里有一个违和点，就是 overlap 是 chunk 执行的，scale 需要按 chunk 进行 transpose，而不是整个一次性 transpose，不然连续性就不对了；所以我想让通信那边改一下，在输出 unzipped_scale 时就进行分 chunk 的 transpose
-* 也就是，在表面看来，unzipped_scale 仍然是 [num_unzipped_tokens, H/512]，但其实里面的 layout 是这样：对于一个 chunk 的 unzipped_scale[m_start : m_start+m_size]，其实是先理解为将其 view 为 [H/512, m_size]，然后转置但不调用 contiguous
-* 上面说的是 x_scale，其实其他 o2/do3/do1_scale 都是相同逻辑；这并不违反 512B 对齐，因为 DeepGEMM 要求 token 向 128 对齐，128 个 token 至少有 128 个 int scale，也就是 512B，因此即使是最小的 chunk 也能做到对齐
+但是，FP8有两个特殊之处需要特别说明：
+
+* **Scale 分块转置**
+  * DeepGEMM 所有算子的 scale 的底层都是需要是 transpose 的，就是相对于 weight 的 layout 是 transpose 的，且必须向 512B 对齐，这是为了 TMA 加载的连续性；但是表面的 shape 还是不 transpose 的，不要调用 contiguous
+  * 在 baseline 里，由于 dispatch 不支持发送 transpose 的 scale，所以发送的时候是 contiguous 的，发完再由计算自己 transpose；这对 baseline 影响不大，因为 scale 本身很小，对整个完整的 scale tensor 调用一次 transpose 的成本相比后面的大矩阵乘可以忽略，另外 baseline 做了一些融合优化，实际上把 transpose 融合到前面的算子里了
+  * 但是在 overlap 里有一个违和点，就是 overlap 是 chunk 执行的，scale 需要按 chunk 进行 transpose，而不是整个一次性 transpose，不然连续性就不对了；所以我想让通信那边改一下，在输出 unzipped_scale 时就进行分 chunk 的 transpose
+  * 也就是，在表面看来，unzipped_scale 仍然是 [num_unzipped_tokens, H/512]，但其实里面的 layout 是这样：对于一个 chunk 的 unzipped_scale[m_start : m_start+m_size]，其实是先理解为将其 view 为 [H/512, m_size]，然后转置但不调用 contiguous（m_size 指 128 对齐后的）
+  * 上面说的是 x_scale，其实其他 o2/do3/do1_scale 都是相同逻辑；这并不违反 512B 对齐，因为 DeepGEMM 要求 token 向 128 对齐，128 个 token 至少有 128 个 int scale，也就是 512B；由于每个专家的末尾都向 128 对齐了，因此每个 chunk 的开头都是 512B 对齐
+
+* **Wgrad 重新量化**
+  * wgrad 和主干上的 gemm 有个非常大的区别，就是它的量化是在 seq 维上收缩，而主干是在 hidden 维上收缩，因此两者的 FP8 输入和 scale 都不能共用，必须重新量化
+  * 当然，重新量化几乎不会引入精度损失，因为我们用的是 ue8m0（我们当前只支持 ue8m0，后续即使支持 float scale 也只支持 pow2 版本），只修改指数位，只有极少情况会因为指数位溢出导致极小数值被吞掉
+  * 另外，由于 FP8 的数值波动更大，我们要求 FP8 wgrad 的排序是必选项，这正好可以和 requant 算子融合在一起（其实 BF16 我们也想做成默认排序的，但是 BF16 的排序成本较高且没有其他算子可以融合，所以才做成开关的）
+  * 需要注意的是，由于 ue8m0 的量化需要向 512 元素对齐，所以每个专家的 seq 维需要向 512 token 重新对齐，我计划在 requant 时做这个对齐，主干计算时仍然保持 128 对齐即可
+  * baseline 里做了个模拟测试，FP8 wgrad 即使加上 reorder+requant，依然比 BF16 wgrad 快 20% 左右，虽然提升不大，但 wgrad 是和 combine 进行 overlap，FP8 下 combine 并没有变快，因此 wgrad 不会成为瓶颈
