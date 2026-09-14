@@ -18,12 +18,14 @@ public:
 
         int num_threads, num_elems_per_access;
         int num_vecs_per_row, num_vecs_per_thread;
-        bool precise, interleaved;
+        bool precise, interleaved, quant;
         void* task_queue;
         uint32_t task_idx;
         void* o1;
         void* probs;
         void* o2;
+        void* o2_scales;
+        uint32_t scale_stride;
         uint32_t m_alignment;
     };
 
@@ -35,19 +37,18 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&smxx_chunk_weighted_swiglu_impl<
-        {}, {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}, {}
     >);
 }};
 )",
         args.num_threads, args.num_elems_per_access, args.num_vecs_per_row,
-        args.num_vecs_per_thread, args.precise, args.interleaved);
+        args.num_vecs_per_thread, args.precise, args.interleaved, args.quant);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.task_queue, args.task_idx,
-            args.o1, args.probs, args.o2,
-            args.m_alignment));
+            args.task_queue, args.task_idx, args.o1, args.probs, args.o2,
+            args.o2_scales, args.scale_stride, args.m_alignment));
     }
 };
 
@@ -55,6 +56,7 @@ static void __instantiate_kernel() {{
 static void smxx_chunk_weighted_swiglu(const torch::Tensor& o1,
                                        const torch::Tensor& probs,
                                        const torch::Tensor& o2,
+                                       const std::optional<torch::Tensor>& o2_scales,
                                        const torch::Tensor& task_queue,
                                        const int& task_idx,
                                        const int& chunk_size,
@@ -78,12 +80,16 @@ static void smxx_chunk_weighted_swiglu(const torch::Tensor& o1,
         .num_vecs_per_thread = kNumVecsPerThread,
         .precise = precise,
         .interleaved = interleaved,
+        .quant = o2_scales.has_value(),
         .task_queue = task_queue.data_ptr(),
         .task_idx = static_cast<uint32_t>(task_idx),
         .o1 = o1.data_ptr(),
         .probs = probs.data_ptr(),
         .o2 = o2.data_ptr(),
-        .m_alignment = static_cast<uint32_t>(heuristics_runtime->get_mk_alignment_for_contiguous_layout())
+        .o2_scales = o2_scales.has_value() ? o2_scales->data_ptr() : nullptr,
+        .scale_stride = o2_scales.has_value() ? static_cast<uint32_t>(o2_scales->stride(-1)) : 0,
+        .m_alignment = static_cast<uint32_t>(
+            heuristics_runtime->get_mk_alignment_for_contiguous_layout())
     };
     const auto code = SMXXChunkWeightedSwigluRuntime::generate(args);
     const auto runtime = compiler->build("smxx_chunk_weighted_swiglu", code);

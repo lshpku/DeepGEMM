@@ -3,9 +3,11 @@
 #include <cutlass/numeric_types.h>
 
 #include <deep_gemm/common/chunk_task.cuh>
+#include <deep_gemm/common/fp8_quant.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/utils.cuh>
+#include <deep_gemm/ptx/utils.cuh>
 
 namespace deep_gemm {
 
@@ -13,11 +15,11 @@ namespace deep_gemm {
 // NOTES: the gate/up columns are fully interleaved, i.e. `o2[:, j] = silu(o1[:, 2j]) * o1[:, 2j+1] * prob`
 //        the chunk's padded tail is zeroed, or the down GEMM would consume garbage rows
 template <uint32_t kNumThreads, uint32_t kNumElemsPerAccess, uint32_t kNumVecsPerRow,
-          uint32_t kNumVecsPerThread, bool kPrecise, bool kInterleaved>
+          uint32_t kNumVecsPerThread, bool kPrecise, bool kInterleaved, bool kQuant>
 CUTLASS_GLOBAL void __launch_bounds__(kNumThreads)
 smxx_chunk_weighted_swiglu_impl(const int* task_queue, uint32_t task_idx,
                                 const cutlass::bfloat16_t* o1, const float* probs,
-                                cutlass::bfloat16_t* o2,
+                                cutlass::bfloat16_t* o2, uint8_t* o2_scales, uint32_t scale_stride,
                                 uint32_t m_alignment) {
     // Wait for the producer (the gate-up GEMM) when PDL is enabled
     cudaGridDependencySynchronize();
@@ -46,6 +48,10 @@ smxx_chunk_weighted_swiglu_impl(const int* task_queue, uint32_t task_idx,
     using vec_t = int4;
     DG_STATIC_ASSERT(kNumElemsPerAccess * sizeof(cutlass::bfloat16_t) == sizeof(vec_t),
                      "Invalid vector size");
+    // One quantization block is `kGranK` columns, so it must be an exact number of vectors,
+    // and a warp must never straddle two rows, or the lanes of a block would not be a group
+    DG_STATIC_ASSERT(!kQuant || quant::kGranK % kNumElemsPerAccess == 0, "Invalid granularity");
+    DG_STATIC_ASSERT(!kQuant || kNumVecsPerRow % 32 == 0, "Invalid row length");
     constexpr uint32_t kShapeN = kNumVecsPerRow * kNumElemsPerAccess;
     const auto grid_stride = gridDim.x * kNumThreads;
     const auto m_padded = math::ceil_div(m_size, m_alignment) * m_alignment;
@@ -63,57 +69,73 @@ smxx_chunk_weighted_swiglu_impl(const int* task_queue, uint32_t task_idx,
 
     // Issue kNumVecsPerThread loads parallely to increase bandwidth
     #pragma unroll
-    for (uint32_t j = 0; j < kNumVecsPerThread; ++ j) {
-        const auto idx = base + j * grid_stride;
+    for (uint32_t i = 0; i < kNumVecsPerThread; ++ i) {
+        const auto idx = base + i * grid_stride;
         const auto row_in_chunk = idx / kNumVecsPerRow;
-        in_range[j] = idx < num_vecs;
-        is_real[j] = in_range[j] and row_in_chunk < m_size;
-        row[j] = m_start + row_in_chunk;
-        col[j] = (idx % kNumVecsPerRow) * kNumElemsPerAccess;
+        in_range[i] = idx < num_vecs;
+        is_real[i] = in_range[i] && row_in_chunk < m_size;
+        row[i] = m_start + row_in_chunk;
+        col[i] = (idx % kNumVecsPerRow) * kNumElemsPerAccess;
 
-        if (is_real[j]) {
+        if (is_real[i]) {
             if constexpr (kInterleaved) {
-                const auto* ptr = o1 + static_cast<uint64_t>(row[j]) * kShapeN * 2 + col[j] * 2;
-                lo_vec[j] = __ldg(reinterpret_cast<const vec_t*>(ptr));
-                hi_vec[j] = __ldg(reinterpret_cast<const vec_t*>(ptr + kNumElemsPerAccess));
+                const auto* ptr = o1 + static_cast<uint64_t>(row[i]) * kShapeN * 2 + col[i] * 2;
+                lo_vec[i] = __ldg(reinterpret_cast<const vec_t*>(ptr));
+                hi_vec[i] = __ldg(reinterpret_cast<const vec_t*>(ptr + kNumElemsPerAccess));
             } else {
-                const auto* ptr = o1 + static_cast<uint64_t>(row[j]) * kShapeN * 2 + col[j];
-                lo_vec[j] = __ldg(reinterpret_cast<const vec_t*>(ptr));
-                hi_vec[j] = __ldg(reinterpret_cast<const vec_t*>(ptr + kShapeN));
+                const auto* ptr = o1 + static_cast<uint64_t>(row[i]) * kShapeN * 2 + col[i];
+                lo_vec[i] = __ldg(reinterpret_cast<const vec_t*>(ptr));
+                hi_vec[i] = __ldg(reinterpret_cast<const vec_t*>(ptr + kShapeN));
             }
-            prob[j] = probs[row[j]];
+            prob[i] = probs[row[i]];
         }
     }
 
     // Compute in FP32, and zero the chunk's padded tail
     #pragma unroll
-    for (uint32_t j = 0; j < kNumVecsPerThread; ++ j) {
-        if (not in_range[j])
+    for (uint32_t i = 0; i < kNumVecsPerThread; ++ i) {
+        if (!in_range[i])
             continue;
 
-        cutlass::bfloat16_t out[kNumElemsPerAccess] = {};
-        if (is_real[j]) {
-            const auto* lo = reinterpret_cast<const cutlass::bfloat16_t*>(&lo_vec[j]);
-            const auto* hi = reinterpret_cast<const cutlass::bfloat16_t*>(&hi_vec[j]);
+        // A padded row keeps its zeros, which quantize to zeroed data and the `1.0f` exponent
+        float act[kNumElemsPerAccess] = {};
+
+        if (is_real[i]) {
+            const auto* lo = reinterpret_cast<const cutlass::bfloat16_t*>(&lo_vec[i]);
+            const auto* hi = reinterpret_cast<const cutlass::bfloat16_t*>(&hi_vec[i]);
             #pragma unroll
-            for (uint32_t i = 0; i < kNumElemsPerAccess; ++ i) {
+            for (uint32_t j = 0; j < kNumElemsPerAccess; ++ j) {
                 float g, u;
                 if constexpr (kInterleaved) {
-                    const auto* pair = i < kNumElemsPerAccess / 2 ? lo : hi;
-                    const auto k = (i % (kNumElemsPerAccess / 2)) * 2;
+                    const auto* pair = j < kNumElemsPerAccess / 2 ? lo : hi;
+                    const auto k = (j % (kNumElemsPerAccess / 2)) * 2;
                     g = static_cast<float>(pair[k]);
                     u = static_cast<float>(pair[k + 1]);
                 } else {
-                    g = static_cast<float>(lo[i]);
-                    u = static_cast<float>(hi[i]);
+                    g = static_cast<float>(lo[j]);
+                    u = static_cast<float>(hi[j]);
                 }
                 const auto silu = kPrecise ? g * (1.0f / (1.0f + expf(-g)))
-                                            : __fdividef(g, 1.0f + __expf(-g));
-                out[i] = static_cast<cutlass::bfloat16_t>(silu * u * prob[j]);
+                                           : g * __frcp_rn(1.0f + __expf(-g));
+                act[j] = silu * u * prob[i];
             }
         }
-        auto* out_ptr = o2 + static_cast<uint64_t>(row[j]) * kShapeN + col[j];
-        *reinterpret_cast<vec_t*>(out_ptr) = *reinterpret_cast<const vec_t*>(out);
+
+        if constexpr (kQuant) {
+            // One scale per `kGranK` columns, all-reduced over the lanes that share the block
+            const auto exponent = quant::store_quantized(
+                o2, act, row[i], col[i] / kNumElemsPerAccess, true, kNumVecsPerRow);
+            if (ptx::get_lane_idx() % quant::kNumLanesPerBlock == 0)
+                quant::store_scale(o2_scales, scale_stride, row[i], col[i] / quant::kGranK,
+                                   exponent);
+        } else {
+            cutlass::bfloat16_t out[kNumElemsPerAccess];
+            #pragma unroll
+            for (uint32_t j = 0; j < kNumElemsPerAccess; ++ j)
+                out[j] = static_cast<cutlass::bfloat16_t>(act[j]);
+            auto* out_ptr = o2 + static_cast<uint64_t>(row[i]) * kShapeN + col[i];
+            *reinterpret_cast<vec_t*>(out_ptr) = *reinterpret_cast<const vec_t*>(out);
+        }
     }
 }
 

@@ -18,7 +18,7 @@ public:
 
         int num_threads, num_topk;
         int num_vecs_per_row, num_elems_per_access;
-        bool precise, interleaved;
+        bool precise, interleaved, quant;
         void* task_queue;
         uint32_t task_idx;
         void* o1;
@@ -30,6 +30,9 @@ public:
         void* atomic_to_zip;
         void* zip_to_atomic;
         void* recv_token_indices;
+        void* o2_bwd_scales;
+        void* do1_scales;
+        uint32_t scale_stride;
         uint32_t m_alignment;
     };
 
@@ -41,12 +44,12 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&smxx_chunk_weighted_swiglu_grad_impl<
-        {}, {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}, {}
     >);
 }};
 )",
         args.num_threads, args.num_topk, args.num_vecs_per_row, args.num_elems_per_access,
-        args.precise, args.interleaved);
+        args.precise, args.interleaved, args.quant);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -55,6 +58,7 @@ static void __instantiate_kernel() {{
             args.o1, args.probs, args.do2,
             args.o2_bwd, args.do1, args.drecv_probs,
             args.atomic_to_zip, args.zip_to_atomic, args.recv_token_indices,
+            args.o2_bwd_scales, args.do1_scales, args.scale_stride,
             args.m_alignment));
     }
 };
@@ -69,6 +73,8 @@ static void smxx_chunk_weighted_swiglu_grad(const torch::Tensor& o1,
                                             const torch::Tensor& atomic_to_zip,
                                             const torch::Tensor& zip_to_atomic,
                                             const torch::Tensor& recv_token_indices,
+                                            const std::optional<torch::Tensor>& o2_bwd_scales,
+                                            const std::optional<torch::Tensor>& do1_scales,
                                             const torch::Tensor& task_queue,
                                             const int& task_idx,
                                             const int& chunk_size,
@@ -90,6 +96,7 @@ static void smxx_chunk_weighted_swiglu_grad(const torch::Tensor& o1,
         .num_elems_per_access = kNumElemsPerAccess,
         .precise = precise,
         .interleaved = interleaved,
+        .quant = o2_bwd_scales.has_value(),
         .task_queue = task_queue.data_ptr(),
         .task_idx = static_cast<uint32_t>(task_idx),
         .o1 = o1.data_ptr(),
@@ -101,7 +108,12 @@ static void smxx_chunk_weighted_swiglu_grad(const torch::Tensor& o1,
         .atomic_to_zip = atomic_to_zip.data_ptr(),
         .zip_to_atomic = zip_to_atomic.data_ptr(),
         .recv_token_indices = recv_token_indices.data_ptr(),
-        .m_alignment = static_cast<uint32_t>(heuristics_runtime->get_mk_alignment_for_contiguous_layout())
+        .o2_bwd_scales = o2_bwd_scales.has_value() ? o2_bwd_scales->data_ptr() : nullptr,
+        .do1_scales = do1_scales.has_value() ? do1_scales->data_ptr() : nullptr,
+        .scale_stride = o2_bwd_scales.has_value() ?
+            static_cast<uint32_t>(o2_bwd_scales->stride(-1)) : 0,
+        .m_alignment = static_cast<uint32_t>(
+            heuristics_runtime->get_mk_alignment_for_contiguous_layout())
     };
     const auto code = SMXXChunkWeightedSwigluGradRuntime::generate(args);
     const auto runtime = compiler->build("smxx_chunk_weighted_swiglu_grad", code);

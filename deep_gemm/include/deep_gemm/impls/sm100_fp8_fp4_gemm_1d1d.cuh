@@ -33,6 +33,7 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
 CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+                             uint32_t task_idx,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
@@ -187,10 +188,25 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
 
+    // Wait for the chunk to arrive, then stage its task descriptor for the whole CTA
+    // NOTES: one thread per CTA touches the queue, which may be slow mapped host memory;
+    //        the C/D staging area is reused, as the epilogue only writes it much later
+    auto smem_task = reinterpret_cast<int*>(smem_buffer);
+    if constexpr (kGemmType == GemmType::MGroupedChunk) {
+        if (threadIdx.x == 0) {
+            const auto timed_out = chunk::wait_task_ready(grouped_layout, task_idx);
+            chunk::stage_task(smem_task, chunk::read_task(grouped_layout, task_idx));
+            smem_task[3] = timed_out ? 1 : 0;
+        }
+        __syncthreads();
+
+        DG_TRAP_ONLY_DEVICE_ASSERT(smem_task[3] == 0);
+    }
+
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
     auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs, kEnsureZeroPadding, kKAlignment, kGranKA * 4>(
-        shape_m, shape_n, shape_k, grouped_layout);
+        shape_m, shape_n, shape_k, kGemmType == GemmType::MGroupedChunk ? smem_task : grouped_layout);
 
     // Pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;

@@ -60,6 +60,7 @@ try:
         k_grouped_bf16_gemm_tn_contiguous,
         # Chunk-wise kernels for compute-communication overlap
         bf16_chunk_gemm_nt, bf16_chunk_gemm_nn,
+        fp8_chunk_gemm_nt,
         chunk_weighted_swiglu,
         chunk_weighted_swiglu_grad,
         chunk_signal_token_done,
@@ -69,6 +70,7 @@ try:
         sort_unzip_map,
         sort_atomic_map,
         token_gather,
+        requant_wgrad_input,
         # Einsum kernels
         einsum,
         fp8_einsum,

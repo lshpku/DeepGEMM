@@ -19,6 +19,7 @@ public:
         bool output_atomic;
         void* zip_to_atomic;
         void* m_start;
+        void* m_start_out;
         void* out;
         uint32_t num_recv_tokens;
     };
@@ -40,7 +41,7 @@ static void __instantiate_kernel() {{
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.zip_to_atomic, args.m_start, args.out,
+            args.zip_to_atomic, args.m_start, args.m_start_out, args.out,
             args.num_recv_tokens));
     }
 };
@@ -48,6 +49,7 @@ static void __instantiate_kernel() {{
 // Build one of the standard unzip order maps, with one CTA per expert
 static void smxx_sort_map(const torch::Tensor& zip_to_atomic,
                           const torch::Tensor& m_start,
+                          const torch::Tensor& m_start_out,
                           const torch::Tensor& out,
                           const bool& output_atomic) {
     constexpr int kNumThreads = 1024;
@@ -60,6 +62,7 @@ static void smxx_sort_map(const torch::Tensor& zip_to_atomic,
         .output_atomic = output_atomic,
         .zip_to_atomic = zip_to_atomic.data_ptr(),
         .m_start = m_start.data_ptr(),
+        .m_start_out = m_start_out.data_ptr(),
         .out = out.data_ptr(),
         .num_recv_tokens = static_cast<uint32_t>(zip_to_atomic.size(0))
     };

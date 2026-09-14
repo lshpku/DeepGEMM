@@ -27,9 +27,12 @@ warp_inclusive_cumsum(uint32_t value) {
 //        that makes `recv_token_indices` unnecessary here
 // NOTES: `kOutputAtomic` picks what a row holds, either the unduplicated token in the DeepEP
 //        order (`ordered_to_zip`) or the row of the given atomic order (`ordered_to_atomic`)
+// NOTES: `m_start` is the source layout's, which is what tells the experts apart, while
+//        `m_start_out` is the destination's; they differ when the wgrad wants every expert
+//        re-aligned to 512 tokens while the main branch stays at 128
 template <uint32_t kNumThreads, uint32_t kNumTopk, bool kOutputAtomic>
 CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
-smxx_sort_map_impl(const int* zip_to_atomic, const int* m_start, int* out,
+smxx_sort_map_impl(const int* zip_to_atomic, const int* m_start, const int* m_start_out, int* out,
                    uint32_t num_recv_tokens) {
     DG_STATIC_ASSERT(kNumThreads % 32 == 0, "Invalid thread number");
     constexpr uint32_t kNumWarps = kNumThreads / 32;
@@ -39,6 +42,8 @@ smxx_sort_map_impl(const int* zip_to_atomic, const int* m_start, int* out,
 
     const auto row_begin = m_start[blockIdx.x];
     const auto row_end = m_start[blockIdx.x + 1];
+    const auto out_begin = m_start_out[blockIdx.x];
+    const auto out_end = m_start_out[blockIdx.x + 1];
     const auto warp_idx = threadIdx.x / 32;
     const auto lane_idx = ptx::get_lane_idx();
     const auto lane_active = kNumWarps == 32 || lane_idx < kNumWarps;
@@ -105,7 +110,7 @@ smxx_sort_map_impl(const int* zip_to_atomic, const int* m_start, int* out,
                 if (row >= row_begin && row < row_end) {
                     const auto slot = base + i * kNumElemsPerAccess + j;
                     const auto token_idx = slot / kNumTopk;
-                    out[row_begin + count] =
+                    out[out_begin + count] =
                         kOutputAtomic ? row : static_cast<int>(token_idx);
                     ++ count;
                 }
@@ -144,13 +149,13 @@ smxx_sort_map_impl(const int* zip_to_atomic, const int* m_start, int* out,
 
         if (valid) {
             const auto token_idx = slot / kNumTopk;
-            out[row_begin + count] =
+            out[out_begin + count] =
                 kOutputAtomic ? row : static_cast<int>(token_idx);
         }
     }
 
     if (threadIdx.x == 0) {
-        if (row_begin + global_count > row_end) {
+        if (out_begin + global_count > out_end) {
             printf("sort_map global_count overflow: expert_idx=%u, global_count=%u, "
                    "row_begin=%d, row_end=%d\n", blockIdx.x, global_count, row_begin, row_end);
             DG_TRAP_ONLY_DEVICE_ASSERT(0);
@@ -158,7 +163,7 @@ smxx_sort_map_impl(const int* zip_to_atomic, const int* m_start, int* out,
     }
 
     // The expert's padded tail, which no token maps to
-    for (uint32_t row = row_begin + global_count + threadIdx.x; row < row_end; row += kNumThreads)
+    for (uint32_t row = out_begin + global_count + threadIdx.x; row < out_end; row += kNumThreads)
         out[row] = -1;
 }
 
