@@ -1,4 +1,4 @@
-"""离线顺序转换函数 (sort_unzip_map / sort_atomic_map / token_gather) 的正确性测试."""
+"""离线顺序转换函数 (sort_map / token_gather) 的正确性测试."""
 
 import paddle
 
@@ -55,23 +55,34 @@ def main():
         topk_indices, tokens_per_expert, m_start)
     m_start_gpu = paddle.to_tensor(m_start, dtype="int32")
 
-    ############################### sort_unzip_map ###############################
+    ################################## sort_map #################################
 
-    ordered_to_zip = deep_gemm.sort_unzip_map(zip_to_atomic, m_start_gpu, num_unzipped_tokens)
+    ordered_to_zip, _ = deep_gemm.sort_map(zip_to_atomic, m_start_gpu, num_unzipped_tokens)
     check("ordered_to_zip",
           ordered_to_zip,
           reference_ordered_to_zip(tokens_per_expert, m_start, atomic_to_zip))
 
-    # 反向 atomic 序的 zip_to_atomic 必须给出同一张表 (标准序只由 DeepEP 序决定)
-    check("ordered_to_zip (bwd table)",
-          deep_gemm.sort_unzip_map(zip_to_atomic_bwd, m_start_gpu, num_unzipped_tokens),
-          ordered_to_zip)
-
-    ############################### sort_atomic_map ##############################
-
+    # 反向 atomic 序的 zip_to_atomic 必须给出同一张 ordered_to_zip (标准序只由 DeepEP 序决定)
+    ordered_to_zip_bwd, ordered_to_atomic = deep_gemm.sort_map(
+        zip_to_atomic_bwd, m_start_gpu, num_unzipped_tokens)
+    check("ordered_to_zip (bwd table)", ordered_to_zip_bwd, ordered_to_zip)
     check("ordered_to_atomic",
-          deep_gemm.sort_atomic_map(zip_to_atomic_bwd, m_start_gpu, num_unzipped_tokens),
+          ordered_to_atomic,
           reference_ordered_to_atomic(tokens_per_expert, m_start, atomic_to_zip_bwd))
+
+    # 512 对齐的目标布局: 输入判定仍按 128 对齐的 m_start, 输出偏移换成 m_start_out
+    m_start_512 = [0]
+    for n in tokens_per_expert:
+        m_start_512.append(m_start_512[-1] + (n + 511) // 512 * 512)
+    m_start_512_gpu = paddle.to_tensor(m_start_512, dtype="int32")
+    zip_512, atomic_512 = deep_gemm.sort_map(
+        zip_to_atomic_bwd, m_start_gpu, m_start_512[-1], m_start_512_gpu)
+    for name, out_512, out_128 in (("zip", zip_512, ordered_to_zip),
+                                   ("atomic", atomic_512, ordered_to_atomic)):
+        ref = paddle.full([m_start_512[-1]], -1, dtype="int32")
+        for n, off, off_512 in zip(tokens_per_expert, m_start, m_start_512):
+            ref[off_512 : off_512 + n] = out_128[off : off + n]
+        check(f"ordered_to_{name} (512 aligned)", out_512, ref)
 
     ################################ token_gather ###############################
 
@@ -83,8 +94,6 @@ def main():
     check("token_gather (unzip)", deep_gemm.token_gather(recv_x, ordered_to_zip), x_ref)
 
     # 反向: 从 atomic 序的 do3 得到标准序的 do3
-    ordered_to_atomic = deep_gemm.sort_atomic_map(
-        zip_to_atomic_bwd, m_start_gpu, num_unzipped_tokens)
     do3 = paddle.randn([num_unzipped_tokens, H], dtype="bfloat16")
     do3_ref = paddle.zeros_like(do3)
     valid = (ordered_to_atomic >= 0).nonzero().squeeze(1)

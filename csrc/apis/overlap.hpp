@@ -363,12 +363,12 @@ static std::tuple<torch::Tensor, torch::Tensor> requant_wgrad_input(const torch:
 }
 
 // Shared checks of the two offline order maps, both of which only scan one `zip_to_atomic`
-// NOTES: these run after the whole dispatch, so there is no consistency logic at all
-static torch::Tensor sort_map(const torch::Tensor& zip_to_atomic,
-                              const torch::Tensor& m_start,
-                              const std::optional<torch::Tensor>& m_start_out,
-                              const int& num_output_rows,
-                              const bool& output_atomic) {
+// NOTES: this runs after the whole dispatch, so there is no consistency logic at all
+static std::tuple<torch::Tensor, torch::Tensor> sort_map(
+        const torch::Tensor& zip_to_atomic,
+        const torch::Tensor& m_start,
+        const int& num_output_rows,
+        const std::optional<torch::Tensor>& m_start_out) {
     // `zip_to_atomic` uses the DeepEP order, matching `recv_token_indices` slot by slot
     const auto [num_recv_tokens, num_topk] = get_shape<2>(zip_to_atomic);
     DG_HOST_ASSERT(num_recv_tokens > 0 and num_topk > 0);
@@ -385,30 +385,11 @@ static torch::Tensor sort_map(const torch::Tensor& zip_to_atomic,
     DG_HOST_ASSERT(m_start.numel() >= 2);
     DG_HOST_ASSERT(num_output_rows > 0);
 
-    const auto out = torch::empty({num_output_rows}, zip_to_atomic.options());
-    smxx_sort_map(zip_to_atomic, m_start, m_start_out.value_or(m_start), out, output_atomic);
-    return out;
-}
-
-// The standard unzip order of the forward, i.e. what Paddle's `unzip` would produce
-// NOTES: the returned `ordered_to_zip` has the shape of `atomic_to_zip`, but each expert's
-//        region is sorted by the token's index in the DeepEP order, so one `token_gather` from
-//        the un-unzipped `recv_x` gives the reference `unzipped_tokens`; padding rows hold `-1`
-static torch::Tensor sort_unzip_map(const torch::Tensor& zip_to_atomic,
-                                    const torch::Tensor& m_start,
-                                    const int& num_output_rows,
-                                    const std::optional<torch::Tensor>& m_start_out) {
-    return sort_map(zip_to_atomic, m_start, m_start_out, num_output_rows, false);
-}
-
-// The standard unzip order to the atomic order of the same pass
-// NOTES: the returned `ordered_to_atomic` maps a reference row to its atomic row, so one
-//        `token_gather` brings any atomic-order buffer into the reference order; padding `-1`
-static torch::Tensor sort_atomic_map(const torch::Tensor& zip_to_atomic,
-                                     const torch::Tensor& m_start,
-                                     const int& num_output_rows,
-                                     const std::optional<torch::Tensor>& m_start_out) {
-    return sort_map(zip_to_atomic, m_start, m_start_out, num_output_rows, true);
+    const auto ordered_to_zip = torch::empty({num_output_rows}, zip_to_atomic.options());
+    const auto ordered_to_atomic = torch::empty({num_output_rows}, zip_to_atomic.options());
+    smxx_sort_map(zip_to_atomic, m_start, m_start_out.value_or(m_start),
+                  ordered_to_zip, ordered_to_atomic);
+    return {ordered_to_zip, ordered_to_atomic};
 }
 
 // `paddle.gather(x, index, axis=0)` with `-1` gathering a zeroed row instead of the last one
@@ -464,10 +445,7 @@ static void register_apis(pybind11::module_& m) {
           py::arg("token_done"), py::arg("zip_done"),
           py::arg("task_queue"), py::arg("task_idx"), py::arg("chunk_size"));
     m.attr("num_chunk_task_fields") = static_cast<int>(kNumChunkTaskFields);
-    m.def("sort_unzip_map", &sort_unzip_map,
-          py::arg("zip_to_atomic"), py::arg("m_start"), py::arg("num_output_rows"),
-          py::arg("m_start_out") = std::nullopt);
-    m.def("sort_atomic_map", &sort_atomic_map,
+    m.def("sort_map", &sort_map,
           py::arg("zip_to_atomic"), py::arg("m_start"), py::arg("num_output_rows"),
           py::arg("m_start_out") = std::nullopt);
     m.def("token_gather", &token_gather,

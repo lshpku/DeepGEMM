@@ -67,8 +67,7 @@ try:
         chunk_zip,
         num_chunk_task_fields,
         # Offline order conversion helpers
-        sort_unzip_map,
-        sort_atomic_map,
+        sort_map,
         token_gather,
         requant_wgrad_input,
         # Einsum kernels
