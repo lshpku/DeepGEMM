@@ -1,5 +1,4 @@
 import time
-import argparse
 import numpy as np
 from typing import NamedTuple
 
@@ -15,10 +14,7 @@ paddle.seed(0)
 import deep_gemm
 print("deep_gemm:", deep_gemm.__path__)
 
-from utils import (
-    make_deepep_layout, make_atomic_layout, make_task_queue, interleave_gateup,
-    deinterleave_gateup, get_atomic_perm,
-)
+from utils import make_deepep_layout, make_atomic_layout, make_task_queue, get_atomic_perm
 
 # 使用特别编译的注释掉 deep_gemm 的版本, 不然会和我们的头文件冲突
 import paddlefleet_ops
@@ -34,11 +30,10 @@ TOPK = 8
 CHUNK = 4096
 NUM_SMS = 100
 ALIGNMENT = 128
-PRECISE_SWIGLU = False
-INTERLEAVED = False
 
 USE_UE8M0 = True  # 当前只支持 ue8m0
 QUANT_BLOCK_SIZE = 512
+SCALE_1E0 = 0x7f7f7f7f
 
 
 class Result(NamedTuple):
@@ -48,11 +43,13 @@ class Result(NamedTuple):
     o3: Tensor
     out: Tensor
     do2: Tensor
-    do1: Tensor
+    do1: tuple[Tensor, Tensor]
     dx: Tensor
     drecv_x: Tensor
     drecv_probs: Tensor
-    o2_bwd: Tensor
+    o2_bwd: Tensor | tuple[Tensor, Tensor]
+    w_gateup_grad: Tensor
+    w_down_grad: Tensor
 
     def __getitem__(self, key: str):
         return getattr(self, key)
@@ -83,12 +80,7 @@ def quant_wgrad_input(x):
 
 
 def to_mn_major(quant_pair):
-    """[hidden, token] -> [token, hidden], 仅用于适配 k_grouped tn 的 MN-major 要求.
-
-    这一步不属于方案成本: paddle 的量化算子沿最后一维分块, 所以沿 token 分块就必然把 token 放在
-    最后一维输出; 真实方案里由自己的融合算子直接写出 [token, hidden] 的数据 + 沿 token 分块的
-    scale, 单遍读写即可, 不存在这次转置.
-    """
+    """[hidden, token] -> [token, hidden], 仅用于适配 k_grouped tn 的 MN-major 要求."""
     x_fp8_t, scale = quant_pair
     return x_fp8_t.view("int8").T.contiguous().view("float8_e4m3fn"), scale
 
@@ -183,6 +175,7 @@ def reference(recv_x, recv_probs, topk_indices, tokens_per_expert, m_indices,
         input_transpose=False,
         using_ue8m0_scale=USE_UE8M0,
     )
+    do1_quant = (do1_fp8, do1_scale.T)
 
     dx = paddle.empty(x_fp8.shape, dtype="bfloat16")
     deep_gemm.m_grouped_fp8_gemm_nt_contiguous((do1_fp8, do1_scale.T), w_gateup, dx, m_indices)
@@ -222,8 +215,7 @@ def reference(recv_x, recv_probs, topk_indices, tokens_per_expert, m_indices,
 
     ################################ FP8 Wgrad #################################
 
-    # 用 paddle 的量化算子把 wgrad 的四个输入沿 token 维量化, 再喂给 fp8 的 k_grouped_gemm,
-    # 用于对比 "多出来的量化" 和 "fp8 wgrad 省下来的时间"
+    # 基于 baseline 接入 fp8 k_grouped_gemm, 用于对比 quant 的开销和 fp8 wgrad 的收益
     paddle.base.core.nvprof_nvtx_push("wgrad_fp8_quant")
     quants = [quant_wgrad_input(t) for t in (x_dequant, do1, o2_bwd, do3)]
     paddle.base.core.nvprof_nvtx_pop()
@@ -239,24 +231,122 @@ def reference(recv_x, recv_probs, topk_indices, tokens_per_expert, m_indices,
         o2_q, do3_q, w_down_grad_fp8, ks_cpu, grouped_layout, w_down_grad_fp8)
     paddle.base.core.nvprof_nvtx_pop()
 
-    print("w_gateup_grad bf16:", check(w_gateup_grad, paddle.zeros_like(w_gateup_grad)))
-    print("w_gateup_grad fp8 :", check(w_gateup_grad_fp8, w_gateup_grad))
-    print("w_down_grad   bf16:", check(w_down_grad, paddle.zeros_like(w_down_grad)))
-    print("w_down_grad   fp8 :", check(w_down_grad_fp8, w_down_grad))
-
-    return Result(x, o1, o2, o3, out, do2, do1, dx, drecv_x, drecv_probs, o2_bwd)
+    return Result(x, o1, o2, o3, out, do2, do1_quant, dx, drecv_x, drecv_probs, o2_bwd,
+                  w_gateup_grad, w_down_grad)
 
 
-def compute_chunk(recv_x, recv_probs, topk_indices, w_gateup, w_down, dout,
+def compute_chunk(recv_x, recv_probs, topk_indices, tokens_per_expert, m_start,
+                  w_gateup, w_down, w_gateup_t, w_down_t, dout,
                   atomic_to_zip, zip_to_atomic, atomic_to_zip_bwd, zip_to_atomic_bwd,
                   task_queue, task_queue_bwd):
     num_valid_topk = (topk_indices != -1).sum(axis=-1, dtype="int32")
 
     ################################# Forward ##################################
 
+    # 模拟通信已经给出 unzip 的结果; 通信输出的 scale 已经整体转置
+    recv_x_fp8, recv_scale = recv_x
+    x_fp8 = deep_gemm.token_gather(recv_x_fp8, atomic_to_zip)
+    x_scale = deep_gemm.token_gather(recv_scale, atomic_to_zip)
+    x_scale = x_scale.T.contiguous().T
+    x = (x_fp8, x_scale)
+
+    # paddle scatter 会将 -1 的下标映射到最后一格, 需要多分配一格来接住这些无效值
+    probs_pad = paddle.zeros([len(x_fp8) + 1], dtype="float32")
+    probs_pad.scatter_(zip_to_atomic.flatten(), recv_probs.flatten())
+    probs = probs_pad[:-1]
+
+    o1 = paddle.full([len(x_fp8), 2 * I], float("nan"), dtype="bfloat16")
+    o2_fp8 = paddle.full([len(x_fp8), I], float("nan"), dtype="float8_e4m3fn")
+    # 注意即使是中间变量的 o2_scale 也要转置
+    o2_scale = paddle.full([I // QUANT_BLOCK_SIZE, len(x_fp8)], SCALE_1E0, dtype="int32").T
+    o2 = (o2_fp8, o2_scale)
+    o3 = paddle.full([len(x_fp8), H], float("nan"), dtype="bfloat16")
+    out = paddle.full([len(recv_x_fp8), H], float("nan"), dtype="bfloat16")
+
+    token_done = paddle.zeros([len(recv_probs)], dtype="int32")
+    zip_done = paddle.zeros([len(recv_probs)], dtype="int32")
+
+    paddle.base.core.nvprof_nvtx_push("forward")
+    for task_idx in range(len(task_queue)):
+        deep_gemm.fp8_chunk_gemm_nt((x_fp8, x_scale), w_gateup_t, o1, task_queue, task_idx)
+        deep_gemm.chunk_weighted_swiglu(o1, probs, o2_fp8, task_queue, task_idx, CHUNK,
+                                        o2_scales=o2_scale)
+        deep_gemm.fp8_chunk_gemm_nt((o2_fp8, o2_scale), w_down_t, o3, task_queue, task_idx)
+        deep_gemm.chunk_zip(o3, out, atomic_to_zip, zip_to_atomic, topk_indices, num_valid_topk,
+                            token_done, zip_done, task_queue, task_idx, CHUNK)
+    paddle.base.core.nvprof_nvtx_pop()
+
     ################################# Backward #################################
 
-    return None
+    dout_fp8, dout_scale = dout
+    do3_fp8 = deep_gemm.token_gather(dout_fp8, atomic_to_zip_bwd)
+    do3_scale = deep_gemm.token_gather(dout_scale, atomic_to_zip_bwd)
+    do3_scale = do3_scale.T.contiguous().T
+    do3 = (do3_fp8, do3_scale)
+
+    do2 = paddle.full([len(x_fp8), I], float("nan"), dtype="bfloat16")
+    dx = paddle.full([len(x_fp8), H], float("nan"), dtype="bfloat16")
+    do1_fp8 = paddle.empty([len(x_fp8), 2 * I], dtype="float8_e4m3fn")
+    do1_scale = paddle.full([2 * I // QUANT_BLOCK_SIZE, len(x_fp8)], SCALE_1E0, dtype="int32").T
+    do1 = (do1_fp8, do1_scale)
+    o2_bwd_fp8 = paddle.empty([len(x_fp8), I], dtype="float8_e4m3fn")
+    o2_bwd_scale = paddle.full([I // QUANT_BLOCK_SIZE, len(x_fp8)], SCALE_1E0, dtype="int32").T
+    o2_bwd = (o2_bwd_fp8, o2_bwd_scale)
+    drecv_x = paddle.full_like(out, float("nan"))
+    drecv_probs = paddle.zeros_like(recv_probs)  # 无效位预先填 0
+
+    token_done = paddle.zeros([len(recv_probs)], dtype="int32")
+    zip_done = paddle.zeros([len(recv_probs)], dtype="int32")
+
+    paddle.base.core.nvprof_nvtx_push("backward")
+    for task_idx in range(len(task_queue_bwd)):
+        deep_gemm.fp8_chunk_gemm_nt((do3_fp8, do3_scale), w_down, do2, task_queue_bwd, task_idx)
+        deep_gemm.chunk_weighted_swiglu_grad(
+            o1, probs, do2, o2_bwd_fp8, do1_fp8, drecv_probs, atomic_to_zip_bwd, zip_to_atomic,
+            topk_indices, task_queue_bwd, task_idx, CHUNK,
+            o2_bwd_scales=o2_bwd_scale, do1_scales=do1_scale)
+        deep_gemm.fp8_chunk_gemm_nt((do1_fp8, do1_scale), w_gateup, dx, task_queue_bwd, task_idx)
+        deep_gemm.chunk_zip(dx, drecv_x, atomic_to_zip_bwd, zip_to_atomic_bwd, topk_indices,
+                            num_valid_topk, token_done, zip_done, task_queue_bwd, task_idx, CHUNK)
+    paddle.base.core.nvprof_nvtx_pop()
+
+    ################################## Wgrad ###################################
+
+    # 各专家 seq 维重新向 512 对齐
+    ks_512, m_start_512 = [], [0]
+    for n in tokens_per_expert:
+        n_512 = (n + 511) // 512 * 512
+        m_start_512.append(m_start_512[-1] + n_512)
+        ks_512.append(n_512)
+    m_start_gpu = paddle.to_tensor(m_start, dtype="int32")
+    m_start_512_gpu = paddle.to_tensor(m_start_512, dtype="int32")
+    grouped_layout = paddle.to_tensor(ks_512, dtype="int32")
+
+    paddle.base.core.nvprof_nvtx_push("wgrad_map")
+    ordered_to_zip, ordered_to_atomic = deep_gemm.sort_map(
+        zip_to_atomic_bwd, m_start_gpu, m_start_512[-1], m_start_512_gpu)
+    paddle.base.core.nvprof_nvtx_pop()
+
+    paddle.base.core.nvprof_nvtx_push("requant")
+    # 只有 x 是从 zipped 的向量解压，其他都是原样大小重排
+    x_w = deep_gemm.requant_wgrad_input(recv_x[0], recv_x[1].T.contiguous().T, ordered_to_zip)
+    do1_w = deep_gemm.requant_wgrad_input(*do1, ordered_to_atomic)
+    o2_w = deep_gemm.requant_wgrad_input(*o2_bwd, ordered_to_atomic)
+    do3_w = deep_gemm.requant_wgrad_input(*do3, ordered_to_atomic)
+    paddle.base.core.nvprof_nvtx_pop()
+
+    w_gateup_grad = paddle.zeros([E, H, 2 * I], dtype="float32")
+    w_down_grad = paddle.zeros([E, I, H], dtype="float32")
+
+    paddle.base.core.nvprof_nvtx_push("wgrad")
+    deep_gemm.k_grouped_fp8_gemm_tn_contiguous(
+        x_w, do1_w, w_gateup_grad, ks_512, grouped_layout, w_gateup_grad)
+    deep_gemm.k_grouped_fp8_gemm_tn_contiguous(
+        o2_w, do3_w, w_down_grad, ks_512, grouped_layout, w_down_grad)
+    paddle.base.core.nvprof_nvtx_pop()
+
+    return Result(x, o1, o2, o3, out, do2, do1, dx, drecv_x, drecv_probs, o2_bwd,
+                  w_gateup_grad, w_down_grad)
 
 
 def quant_input(x):
@@ -323,7 +413,7 @@ def check(x, y):
     banner = (" " + "-" * 40) if (avg or max) else ""
     avg = "0" if avg == 0 else f"{avg:e}"
     max = "0" if max == 0 else f"{max:e}"
-    return f"avg: {avg} max: {max}" + banner
+    return f"avg: {avg} max: {max}{banner}"
 
 
 def main():
@@ -337,9 +427,9 @@ def main():
     recv_probs = paddle.randn(topk_indices.shape)
     w_gateup = paddle.randn([E, H, 2 * I], dtype="bfloat16") * 0.02
     w_down = paddle.randn([E, I, H], dtype="bfloat16") * 0.02
-    # w_gateup_ref = deinterleave_gateup(w_gateup) if INTERLEAVED else w_gateup
 
     recv_x_quant = quant_input(recv_x)
+    dout_quant = quant_input(dout)
 
     # fp8 的性能对 layout 敏感, 因此 fp8 需要维护两套 layout 的权重, 不像 bf16 只需要改算子参数
     w_gateup_quant = quant_weight(w_gateup, transpose=False)
@@ -352,26 +442,67 @@ def main():
     refs = reference(recv_x_quant, recv_probs, topk_indices, tokens_per_expert, m_indices,
                      w_gateup_quant, w_down_quant, w_gateup_t_quant, w_down_t_quant, dout)
 
-    for name, tensor in refs._asdict().items():
-        if isinstance(tensor, tuple):
-            tensor = dequant(*tensor)
-        print(name, ":", tensor)
-
     ################################## Chunk ###################################
 
+    atomic_to_zip, zip_to_atomic = make_atomic_layout(topk_indices, tokens_per_expert, m_start)
+    atomic_to_zip_bwd, zip_to_atomic_bwd = make_atomic_layout(
+        topk_indices, tokens_per_expert, m_start)
+    task_queue = make_task_queue(tokens_per_expert, m_start, CHUNK, ready=True, seed=0)
+    task_queue_bwd = make_task_queue(tokens_per_expert, m_start, CHUNK, ready=True, seed=1)
+
+    outs = compute_chunk(recv_x_quant, recv_probs, topk_indices, tokens_per_expert, m_start,
+                         w_gateup_quant, w_down_quant, w_gateup_t_quant, w_down_t_quant,
+                         dout_quant, atomic_to_zip, zip_to_atomic, atomic_to_zip_bwd,
+                         zip_to_atomic_bwd, task_queue, task_queue_bwd)
 
     ################################# Validate #################################
 
+    fwd_perm = get_atomic_perm(tokens_per_expert, m_start, atomic_to_zip)
+    bwd_perm = get_atomic_perm(tokens_per_expert, m_start, atomic_to_zip_bwd)
+
+    checks = [
+        (("x", "o1", "o2", "o3"), fwd_perm),
+        (("out",), None),
+        (("do2", "do1", "o2_bwd", "dx"), bwd_perm),
+        (("drecv_x", "drecv_probs", "w_gateup_grad", "w_down_grad"), None),
+    ]
+    for names, perm in checks:
+        for name in names:
+            out, ref = outs[name], refs[name]
+            if isinstance(out, tuple) and isinstance(ref, tuple):
+                # 两边都是 fp8, 直接比较字节
+                out = (out[0].view("int8")[perm], out[1][perm]) if perm is not None else out
+                fp8_diff = int((out[0].view("int8") != ref[0].view("int8")).sum())
+                scale_diff = int((out[1] != ref[1]).sum())
+                banner = (" " + "-" * 40) if (fp8_diff or scale_diff) else ""
+                print(f"{name}: fp8: {fp8_diff} scale: {scale_diff}{banner}")
+            else:
+                # 否则将 fp8 一方先 dequant 再比较
+                out = dequant(*out) if isinstance(out, tuple) else out
+                out = out[perm] if perm is not None else out
+                print(f"{name}:", check(out, ref))
+
+    ################################# Profile ##################################
+
+    del refs, outs
+
+    paddle.base.core.nvprof_start()
+
+    paddle.base.core.nvprof_nvtx_push("baseline")
+    reference(recv_x_quant, recv_probs, topk_indices, tokens_per_expert, m_indices,
+              w_gateup_quant, w_down_quant, w_gateup_t_quant, w_down_t_quant, dout)
+    paddle.base.core.nvprof_nvtx_pop()
+
+    paddle.base.core.nvprof_nvtx_push("chunk")
+    compute_chunk(recv_x_quant, recv_probs, topk_indices, tokens_per_expert, m_start,
+                  w_gateup_quant, w_down_quant, w_gateup_t_quant, w_down_t_quant,
+                  dout_quant, atomic_to_zip, zip_to_atomic, atomic_to_zip_bwd, zip_to_atomic_bwd,
+                  task_queue, task_queue_bwd)
+    paddle.base.core.nvprof_nvtx_pop()
+
+    paddle.device.synchronize()
+    paddle.base.core.nvprof_stop()
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--precise-swiglu", action="store_true",
-                        help="Use precise swiglu, only applies for unfused swiglu")
-    parser.add_argument("--interleaved", action="store_true",
-                        help="Use fully-interleaved w_gateup, only applies for unfused swiglu")
-    args = parser.parse_args()
-
-    PRECISE_SWIGLU = args.precise_swiglu
-    INTERLEAVED = args.interleaved
-
     main()
