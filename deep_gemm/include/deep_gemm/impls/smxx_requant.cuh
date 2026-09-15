@@ -41,9 +41,10 @@ smxx_requant_impl(const uint8_t* __restrict__ src, const uint8_t* __restrict__ s
     cudaGridDependencySynchronize();
 
     // The tile is one quantization block of tokens wide
-    __shared__ uint8_t smem_tile[quant::kGranK][kBlockH];
-    __shared__ uint8_t smem_src_exp[quant::kGranK][kNumGranKPerTile];
     __shared__ float smem_scale[kBlockH];
+    __shared__ float smem_amax[kBlockH + kBlockH / 32];
+    smem_amax[threadIdx.x + threadIdx.x / 32] = 0.0f;
+    __syncthreads();
 
     const auto ch_base = blockIdx.y * kBlockH;
     const auto pack_base = blockIdx.x * quant::kGranK * quant::kNumGranKPerPack;
@@ -54,67 +55,86 @@ smxx_requant_impl(const uint8_t* __restrict__ src, const uint8_t* __restrict__ s
     #pragma unroll 1
     for (uint32_t b = 0; b < quant::kNumGranKPerPack; ++ b) {
         const auto row_base = pack_base + b * quant::kGranK;
+        float local_amax[kNumElemsPerAccess] = {};
 
-        // Stage the tile and the source exponents
+        // Compute local amax, caching the tile in L1
         for (uint32_t i = threadIdx.x; i < kNumVecsPerTile; i += kNumThreads) {
             const auto token = i / kNumVecsPerRow;
             const auto vec_idx = i % kNumVecsPerRow;
             const auto src_row = index[row_base + token];
+            const auto gran_k_idx = (ch_base + vec_idx * kNumElemsPerAccess) / quant::kGranK;
             vec_t vec = {};
-            if (src_row >= 0)
-                vec = __ldg(reinterpret_cast<const vec_t*>(
+            float scale = 0.0f;
+
+            if (src_row >= 0) {
+                // Do not use __ldg as it has bypass-cache semantics
+                vec = *reinterpret_cast<const vec_t*>(
                     src + static_cast<uint64_t>(src_row) * hidden + ch_base +
-                    vec_idx * kNumElemsPerAccess));
-            *reinterpret_cast<vec_t*>(&smem_tile[token][vec_idx * kNumElemsPerAccess]) = vec;
-        }
-        for (uint32_t i = threadIdx.x; i < quant::kGranK * kNumGranKPerTile; i += kNumThreads) {
-            const auto token = i / kNumGranKPerTile;
-            const auto gran_k_idx = ch_base / quant::kGranK + i % kNumGranKPerTile;
-            const auto src_row = index[row_base + token];
-            uint8_t exponent = 0;
-            if (src_row >= 0)
-                exponent = src_scales[
+                    vec_idx * kNumElemsPerAccess);
+                const auto exponent = src_scales[
                     (static_cast<uint64_t>(gran_k_idx / quant::kNumGranKPerPack) *
                      src_scale_stride + src_row) * 4 + gran_k_idx % quant::kNumGranKPerPack];
-            smem_src_exp[token][i % kNumGranKPerTile] = exponent;
+                scale = __uint_as_float(static_cast<uint32_t>(exponent) << 23);
+            }
+
+            #pragma unroll
+            for (uint32_t j = 0; j < kNumElemsPerAccess; ++ j) {
+                const auto value =
+                    quant::fp8_to_float(reinterpret_cast<const uint8_t*>(&vec)[j]) * scale;
+                local_amax[j] = fmaxf(local_amax[j], fabsf(value));
+            }
+        }
+
+        // Compute amax
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumElemsPerAccess; ++ i) {
+            const auto ch = threadIdx.x * kNumElemsPerAccess % kBlockH + i;
+            // Any float >= 0.0 (excluding -0.0) can be compared as uint32
+            atomicMax(reinterpret_cast<uint32_t*>(smem_amax + ch + ch / 32),
+                      __float_as_uint(local_amax[i]));
         }
         __syncthreads();
 
-        // Reduce along the tokens, one channel per thread
-        // NOTES: a source exponent byte is the biased exponent of the dequantization
-        //        multiplier, so the byte shifted into place is that power of two
-        float amax = 0.0f;
-        const auto gran_k_in_tile = threadIdx.x / quant::kGranK;
-        #pragma unroll 8
-        for (uint32_t token = 0; token < quant::kGranK; ++ token) {
-            const auto value = quant::fp8_to_float(smem_tile[token][threadIdx.x]) *
-                               __uint_as_float(static_cast<uint32_t>(
-                                   smem_src_exp[token][gran_k_in_tile]) << 23);
-            amax = fmaxf(amax, fabsf(value));
-        }
+        const auto amax = smem_amax[threadIdx.x + threadIdx.x / 32];
         const auto block = quant::compute_pow2_scale(amax);
         smem_scale[threadIdx.x] = block.scale;
         exponents[b] = block.exponent;
+        smem_amax[threadIdx.x + threadIdx.x / 32] = 0.0f;
         __syncthreads();
 
         // Quantize and store, coalesced along the channels again
         for (uint32_t i = threadIdx.x; i < kNumVecsPerTile; i += kNumThreads) {
             const auto token = i / kNumVecsPerRow;
+            const auto vec_idx = i % kNumVecsPerRow;
+            const auto src_row = index[row_base + token];
+            const auto gran_k_idx = (ch_base + vec_idx * kNumElemsPerAccess) / quant::kGranK;
+            vec_t vec_in = {};
+            float scale = 0.0f;
+
+            if (src_row >= 0) {
+                vec_in = *reinterpret_cast<const vec_t*>(
+                    src + static_cast<uint64_t>(src_row) * hidden + ch_base +
+                    vec_idx * kNumElemsPerAccess);
+                const auto exponent = src_scales[
+                    (static_cast<uint64_t>(gran_k_idx / quant::kNumGranKPerPack) *
+                     src_scale_stride + src_row) * 4 + gran_k_idx % quant::kNumGranKPerPack];
+                scale = __uint_as_float(static_cast<uint32_t>(exponent) << 23);
+            }
+
             const auto ch = (i % kNumVecsPerRow) * kNumElemsPerAccess;
+            const auto* vec_in_fp8 = reinterpret_cast<const uint8_t*>(&vec_in);
             __nv_fp8x2_e4m3 vec[kNumElemsPerAccess / 2];
+
             #pragma unroll
             for (uint32_t j = 0; j < kNumElemsPerAccess / 2; ++ j) {
-                const auto multiplier = __uint_as_float(static_cast<uint32_t>(
-                    smem_src_exp[token][(ch + j * 2) / quant::kGranK]) << 23);
                 vec[j] = quant::scale_to_fp8x2(
-                    quant::fp8_to_float(smem_tile[token][ch + j * 2]) * multiplier,
-                    quant::fp8_to_float(smem_tile[token][ch + j * 2 + 1]) * multiplier,
+                    quant::fp8_to_float(vec_in_fp8[j * 2]) * scale,
+                    quant::fp8_to_float(vec_in_fp8[j * 2 + 1]) * scale,
                     smem_scale[ch + j * 2], smem_scale[ch + j * 2 + 1]);
             }
             *reinterpret_cast<vec_t*>(out + static_cast<uint64_t>(row_base + token) * hidden +
                                       ch_base + ch) = *reinterpret_cast<const vec_t*>(vec);
         }
-        __syncthreads();
     }
 
     // One int32 per channel, so the whole block writes `kBlockH` consecutive int32
