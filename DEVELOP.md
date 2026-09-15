@@ -25,6 +25,8 @@ python tests_overlap/test_chunk.py --arrival cpu
 python tests_overlap/test_chunk.py --check-signal
 python tests_overlap/test_zip.py
 python tests_overlap/test_sort_map.py
+python tests_overlap/test_forward_backward.py
+python tests_overlap/test_forward_backward_fp8.py
 ```
 
 `test_gemm_baseline.py`：对比group_gemm和chunk的性能测试，一个是调用单次group_gemm，一个是分chunk调用，实测性能差距很小，chunk方案仅慢2%，说明分chunk几乎不影响性能
@@ -33,7 +35,7 @@ python tests_overlap/test_sort_map.py
 
 `test_zip.py`：融合 zip 算子（done+zip）的正确性测试。按真实路由构造 4096 个不重复 token、topk=8、专家区域向 128 对齐的 o3（atomic 序，行内乱序），用乱序 task_queue 逐 chunk 调 `chunk_zip`，与 `paddle.nn.functional.moe_unpermute` 逐位比对 `combine_input`，并检查 `zip_done` 全 1、`token_done` 恰好等于 `num_valid_topk`。三组 `(num_sms, chunk)` 配置覆盖每专家单 chunk、多 chunk + 余数 chunk、以及 CTA 本地队列被压满的情况，三种不同的到达顺序给出逐位相同的结果，即验证了确定性
 
-`test_sort_map.py`：离线顺序转换函数（`sort_unzip_map` / `sort_atomic_map` / `token_gather`）的正确性测试。按真实路由构造两份不同的 atomic 序（前向/反向），与 python 侧的 sort/argsort 参考逐位比对两张映射表，并用 `token_gather` 验证解压（recv_x → 标准序）、重排（atomic 序 → 标准序）和两者串联的结果，附带一组 fp32 + 非幂次行长的输入
+`test_sort_map.py`：离线顺序转换函数（`sort_map` / `token_gather`）的正确性测试。按真实路由构造两份不同的 atomic 序（前向/反向），与 python 侧的 sort/argsort 参考逐位比对两张映射表，并用 `token_gather` 验证解压（recv_x → 标准序）、重排（atomic 序 → 标准序）和两者串联的结果，附带一组 fp32 + 非幂次行长的输入
 
 
 ## 开发进展
@@ -145,3 +147,12 @@ python tests_overlap/test_sort_map.py
 
 9.10: 移除 epilogue swiglu 融合，前反向均使用独立 swiglu 算子
 * 因为后续计划往 activation 阶段加入更多计算，当前融合算子无法满足需求，且维护困难，因此暂时移除；实际上目前测试下来融合 swiglu 虽然对单个算子有影响，但放到端到端影响极小，后续如果还有明确需求再加回来
+
+
+9.14: 新增 FP8 chunk GEMM（`fp8_chunk_gemm_nt`），并确定 scale 用全局 transpose 而不是按 chunk transpose
+* kernel 侧改动极小：`sm100_fp8_fp4_gemm_1d1d_impl` 加一个 `task_idx` 参数和 bf16 同一套领任务前言（`wait_task_ready` + `stage_task` 到 smem 的 C/D 区，`__syncthreads` 后全 CTA 统一 trap），调度器复用已有的 `GemmType::MGroupedChunk`
+* SF 路径**完全不用改**：`is_m_grouped_contiguous(MGroupedChunk)` 已经是 true，所以 `sfa_k_idx` 不带专家偏移，而 `sfa_m_idx = m_block_idx * BLOCK_M` 里的 `m_block_idx` 已经被调度器加上了 `chunk_m_block_offset`；SFB 走 `current_group_idx`（= `expert_idx`）拿专家偏移，和 m-grouped 一模一样
+
+9.14: 新增 `requant_wgrad_input`，FP8 主干 + wgrad 全链路打通
+* API 为 `requant_wgrad_input(src, src_scales, index) -> (out, out_scales)`：把主干的 fp8（沿 hidden 维量化）重新量化成 wgrad 要的沿 token 维量化，并融合排序 + 每专家向 512 token 对齐
+* 输出 layout 就是 `k_grouped_fp8_gemm_tn_contiguous` 要的：数据 `[sum_k, hidden]` 行主序，scale 是连续的 `[sum_k/512, hidden]` int32（一个 int32 的 4 个字节是 4 个 token 块），所以不再需要 baseline 那次 `[hidden, token] -> [token, hidden]` 的转置，也不需要 deep_gemm 内部再 pack 一次

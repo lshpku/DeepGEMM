@@ -151,15 +151,11 @@ drecv_probs 是一个和 recv_token_indices 相同 shape 和 token 槽位的 ten
 需要一些顺序转换函数来高效压测正确性，用 sort 固然可以，但是非常影响大规模训练下的压测效率
 以下函数都是离线函数，在通信全部结束后才进行，不需要处理任何一致性逻辑
 
-`sort_unzip_map`
-* 输入：前向的 zip_to_atomic 等变量
+`sort_map`
+* 输入：一份 zip_to_atomic（前反向均可，但实际只对反向使用），以及源布局的 m_start；可选的 m_start_out 用于指定目标布局的偏移（wgrad 要 512 对齐，主干仍是 128 对齐）
 * 输出：
-  * ordered_to_zip [num_unzipped_tokens] int32 : 和前向 atomic_to_zip 的 shape 一样，但是每个专家内的 token 是按照它们在 DeepEP 序中的顺序排序的，对应 paddle 标准的 unzip 的行为，这样用户就可以通过一次 gather 从前向未 unzip 的 recv_x [num_recv_tokens, hidden] 中解压出 paddle 标准顺序的 unzipped_tokens；padding 位填 -1
-
-`sort_atomic_map`
-* 输入：反向的 zip_to_atomic 等变量
-* 输出：
-  * ordered_to_atomic [num_unzipped_tokens] int32 : 将标准 unzip 序映射到反向 atomic 序的映射表，这样用户可以通过一次 gather 从反向 atomic 序的 do1/o2_bwd/do3 得到 paddle 标准顺序的 do1/o2_bwd/do3；padding 位填 -1
+  * ordered_to_zip [num_output_rows] int32 : 和 atomic_to_zip 的 shape 一样，但是每个专家内的 token 是按照它们在 DeepEP 序中的顺序排序的，对应 paddle 标准的 unzip 的行为，这样用户就可以通过一次 gather 从未 unzip 的 recv_x [num_recv_tokens, hidden] 中解压出 paddle 标准顺序的 unzipped_tokens；padding 位填 -1
+  * ordered_to_atomic [num_output_rows] int32 : 将标准 unzip 序映射到传入的那个 atomic 序的映射表，这样用户可以通过一次 gather 从反向 atomic 序的 do1/o2_bwd/do3 得到 paddle 标准顺序的 do1/o2_bwd/do3；padding 位填 -1
 
 `token_gather`
 * 类似 paddle.gather(x, index, axis=0)，但是对于 -1 的下标直接写 0（paddle 对于 -1 下标是理解为 len(x)-1，这不符合 padding 的要求）
@@ -187,10 +183,13 @@ Paddle 现行的 FP8 baseline 流程可见单测 tests_overlap/test_forward_back
         |                    ^                           ^
         v                    |                           |
     (o1_bf16)       (do1_fp8, do1_scale)       (do1_wfp8, do1_wscale)
-        | \_____________     ^ \______[requant]_____^
-        v               v    |
-  [swiglu+quant]    [swiglu_grad+quant]
-        |                    ^ \_(o2_fp8, o2_scale)__[requant]
+        | \____________      ^ \______[requant]_____^
+        |              \     |
+        |               |    |               (o2_bwd_fp8, o2_bwd_scale)
+        |               |    |    __________________^    |
+        v               v    |   /                       v
+  [swiglu+quant]    [swiglu_grad+quant]              [requant]
+        |                    ^                           |
         v                    |                           v
 (o2_fp8, o2_scale)      (do2_bf16)              (o2_wfp8, o2_wscale)
         |                    ^                           |
@@ -206,14 +205,13 @@ Paddle 现行的 FP8 baseline 流程可见单测 tests_overlap/test_forward_back
 
 新方案相比 BF16 只需要新实现 3 个主要算子：swiglu+quant、swiglu_grad+quant、requant；FP8 gemm 只需仿照 BF16 加上信号等待逻辑
 
+
 但是，FP8有两个特殊之处需要特别说明：
 
-* **Scale 分块转置**
+* **Scale 转置**
   * DeepGEMM 所有算子的 scale 的底层都是需要是 transpose 的，就是相对于 weight 的 layout 是 transpose 的，且必须向 512B 对齐，这是为了 TMA 加载的连续性；但是表面的 shape 还是不 transpose 的，不要调用 contiguous
   * 在 baseline 里，由于 dispatch 不支持发送 transpose 的 scale，所以发送的时候是 contiguous 的，发完再由计算自己 transpose；这对 baseline 影响不大，因为 scale 本身很小，对整个完整的 scale tensor 调用一次 transpose 的成本相比后面的大矩阵乘可以忽略，另外 baseline 做了一些融合优化，实际上把 transpose 融合到前面的算子里了
-  * 但是在 overlap 里有一个违和点，就是 overlap 是 chunk 执行的，scale 需要按 chunk 进行 transpose，而不是整个一次性 transpose，不然连续性就不对了；所以我想让通信那边改一下，在输出 unzipped_scale 时就进行分 chunk 的 transpose
-  * 也就是，在表面看来，unzipped_scale 仍然是 [num_unzipped_tokens, H/512]，但其实里面的 layout 是这样：对于一个 chunk 的 unzipped_scale[m_start : m_start+m_size]，其实是先理解为将其 view 为 [H/512, m_size]，然后转置但不调用 contiguous（m_size 指 128 对齐后的）
-  * 上面说的是 x_scale，其实其他 o2/do3/do1_scale 都是相同逻辑；这并不违反 512B 对齐，因为 DeepGEMM 要求 token 向 128 对齐，128 个 token 至少有 128 个 int scale，也就是 512B；由于每个专家的末尾都向 128 对齐了，因此每个 chunk 的开头都是 512B 对齐
+  * 在 overlap 里也遵循 baseline 的转置方式，即对整个 scale 整体进行转置，不需要考虑 chunk 的影响，因为 gemm 里面恰好使用 transpose 的下标对 scale 进行访存，整体转置之后每个 chunk 恰好可以读到对应的 scale；因此，通信在给出 unzipped scale 时就应当以整体转置的 layout 给出
 
 * **Wgrad 重新量化**
   * wgrad 和主干上的 gemm 有个非常大的区别，就是它的量化是在 seq 维上收缩，而主干是在 hidden 维上收缩，因此两者的 FP8 输入和 scale 都不能共用，必须重新量化
@@ -221,3 +219,10 @@ Paddle 现行的 FP8 baseline 流程可见单测 tests_overlap/test_forward_back
   * 另外，由于 FP8 的数值波动更大，我们要求 FP8 wgrad 的排序是必选项，这正好可以和 requant 算子融合在一起（其实 BF16 我们也想做成默认排序的，但是 BF16 的排序成本较高且没有其他算子可以融合，所以才做成开关的）
   * 需要注意的是，由于 ue8m0 的量化需要向 512 元素对齐，所以每个专家的 seq 维需要向 512 token 重新对齐，我计划在 requant 时做这个对齐，主干计算时仍然保持 128 对齐即可
   * baseline 里做了个模拟测试，FP8 wgrad 即使加上 reorder+requant，依然比 BF16 wgrad 快 20% 左右，虽然提升不大，但 wgrad 是和 combine 进行 overlap，FP8 下 combine 并没有变快，因此 wgrad 不会成为瓶颈
+
+* 重新量化的溢出风险分析
+  * **上溢不可能发生**：新 scale 取 `2^floor(log2(448/amax))`，必然 `≤ 448/amax`，所以块内最大元素也只映射到 `(224, 448]`，不会饱和
+  * **只可能下溢**：e4m3 最小 normal 是 `2^-6`，所以当 `|v| / amax_new < 2^-6/448 = 3.49e-5` 时元素落进 subnormal，尾数位被截断；低于 `2^-9/448` 直接吞成 0
+  * 换句话说，requant 只关心**两个量化块 amax 的比值**（指数平移量 `t ≈ log2(amax_old / amax_new)`），不关心块内的动态范围
+  * 所以出问题的场景是：某个 token 整行幅度极小（行 amax 很小），而它所在 channel 的列 amax 由别的 token 决定（列 amax 很大），这行元素就会被平移到 subnormal 区
+  * 但这类元素的绝对贡献小于该列最大项的 3.5e-5，对 wgrad 的累加可以忽略；实测均匀数据下 1M 个元素里只有 2 个发生变化
